@@ -2650,10 +2650,18 @@ def _run_xray_batch(
     port_base: int = 20000,
     workers: int = CHECK_WORKERS,
     verbose: bool = True,
+    enable_stage4: bool = False,
 ) -> list[str]:
-    """Run the 3-stage xray check on `links` and return those that pass."""
+    """Run the xray check on `links` and return those that pass.
+
+    enable_stage4=True добавляет Stage 4 (stacked ping latency):
+    каждый конфиг дополнительно проверяется по реальному RTT через xray-стек.
+    Это увеличивает время проверки (~+10-30 сек на конфиг), но отсеивает
+    медленные/нестабильные серверы ещё до загрузки на GitHub.
+    """
     if verbose:
-        print(f"  🔬  xray check: {len(links)} configs | {workers} threads ...", flush=True)
+        stage_label = "4-stage" if enable_stage4 else "3-stage"
+        print(f"  🔬  xray check ({stage_label}): {len(links)} configs | {workers} threads ...", flush=True)
 
     # Прогреваем reference MD5 один раз до запуска воркеров, чтобы не было
     # race condition: без этого все 24 воркера стартуют одновременно и первый
@@ -2689,7 +2697,7 @@ def _run_xray_batch(
     def _check_task(lnk: str):
         p = _acquire_port()
         try:
-            result = check_config_full(lnk, xray_exe, p, skip_stage4=True)
+            result = check_config_full(lnk, xray_exe, p, skip_stage4=not enable_stage4)
         finally:
             _release_port(p)
         return lnk, result
@@ -2717,6 +2725,7 @@ def run_checks(
     port_base: int = 20000,
     workers: int = CHECK_WORKERS,
     verbose: bool = True,
+    enable_stage4: bool = False,
 ) -> list[str]:
     """Convenience wrapper: ping all links then xray-check survivors (single pass).
 
@@ -2725,7 +2734,8 @@ def run_checks(
     passed, _ = _run_ping_batch(links, batch_size=len(links), verbose=verbose)
     if not xray_exe or not passed:
         return passed
-    return _run_xray_batch(passed, xray_exe, port_base, workers, verbose)
+    return _run_xray_batch(passed, xray_exe, port_base, workers, verbose,
+                           enable_stage4=enable_stage4)
 
 
 # ── CLI commands ──────────────────────────────────────────────────────────────
@@ -2849,14 +2859,16 @@ def cmd_update(args):
     sources = [s.strip() for s in (getattr(args, "sources", "") or "kort0881,v2ray_agg,epodonios").split(",")]
     work_dir = Path(getattr(args, "work_dir", None) or
                     Path(tempfile.gettempdir()) / "aegis_admin_sources")
-    fetch_mode  = int(getattr(args, "mode", 4))
-    port_base   = getattr(args, "port_base", 21000)
-    workers     = getattr(args, "workers", CHECK_WORKERS)
-    batch_size  = getattr(args, "batch_size", PING_BATCH_SIZE)
+    fetch_mode    = int(getattr(args, "mode", 4))
+    port_base     = getattr(args, "port_base", 21000)
+    workers       = getattr(args, "workers", CHECK_WORKERS)
+    batch_size    = getattr(args, "batch_size", PING_BATCH_SIZE)
+    enable_stage4 = bool(getattr(args, "enable_stage4", False))
 
     print(f"\n{'='*60}")
     print(f"  📥  Fetching configs from {len(sources)} source(s): {', '.join(sources)}")
-    print(f"  Ping threshold: {MAX_PING_MS} ms  |  Ping batch: {batch_size}  |  Geo filter: DISABLED")
+    stage4_label = "ВКЛ ✓" if enable_stage4 else "выкл"
+    print(f"  Ping threshold: {MAX_PING_MS} ms  |  Ping batch: {batch_size}  |  Stage 4: {stage4_label}")
     print(f"  Work dir: {work_dir}")
     print(f"{'='*60}")
 
@@ -2895,11 +2907,12 @@ def cmd_update(args):
             print("  ⚠  No links passed ping in this batch, continuing...")
             continue
 
-        # Stage 2+3 — xray (skip if no xray binary)
+        # Stage 2+3[+4] — xray (skip if no xray binary)
         if xray_exe:
             working = _run_xray_batch(
                 ping_passed, xray_exe,
                 port_base=port_base, workers=workers, verbose=True,
+                enable_stage4=enable_stage4,
             )
         else:
             working = ping_passed
@@ -2964,6 +2977,7 @@ def cmd_check(args):
         links, xray_exe,
         port_base=getattr(args, "port_base", 21000),
         workers=getattr(args, "workers", CHECK_WORKERS),
+        enable_stage4=bool(getattr(args, "enable_stage4", False)),
     )
 
     out = getattr(args, "output", None)
@@ -3452,6 +3466,18 @@ def _interactive_menu() -> "argparse.Namespace":
         if wi.isdigit():
             args.workers = max(1, min(int(wi), 64))
 
+        # Stage 4 — stacked ping latency
+        print("\n" + "-"*60)
+        print("  Stage 4 — проверка пинга через xray-стек\n")
+        print("  Включить Stage 4?")
+        print("  [ВКЛ] — дополнительно фильтрует медленные серверы (RTT > 995 мс)")
+        print("          ~+10-30 сек на конфиг, но выше качество результата")
+        print("  [выкл] — быстрее, Stage 4 пропускается  [по умолчанию]")
+        s4_choice = input("\n  Stage 4 [y/N]: ").strip().lower()
+        args.enable_stage4 = s4_choice in ("y", "yes", "да", "д")
+        s4_label = "ВКЛ ✓" if args.enable_stage4 else "выкл"
+        print(f"  Stage 4: {s4_label}")
+
         if command == "fetch":
             args.output = input("  Сохранить в файл [Enter=нет]: ").strip() or None
 
@@ -3461,6 +3487,15 @@ def _interactive_menu() -> "argparse.Namespace":
         wi = input(f"  Потоков [Enter={CHECK_WORKERS}]: ").strip()
         if wi.isdigit():
             args.workers = max(1, min(int(wi), 64))
+
+        # Stage 4 для check
+        print("\n" + "-"*60)
+        print("  Stage 4 — проверка пинга через xray-стек\n")
+        print("  Включить Stage 4?")
+        print("  [ВКЛ] — фильтрует медленные серверы (RTT > 995 мс), ~+10-30 сек/конфиг")
+        print("  [выкл] — быстрее, Stage 4 пропускается  [по умолчанию]")
+        s4_choice = input("\n  Stage 4 [y/N]: ").strip().lower()
+        args.enable_stage4 = s4_choice in ("y", "yes", "да", "д")
 
     elif command == "diag":
         args.link     = input("  VPN-ссылка для диагностики: ").strip()
