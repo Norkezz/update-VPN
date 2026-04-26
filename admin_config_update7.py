@@ -1594,17 +1594,22 @@ def _find_or_download_zapret() -> Optional[str]:
             else:
                 arch_dir = "linux-x86_64"
 
-            # zapret2 пакует бинарники внутрь source tarball: binaries/<arch>/nfqws2
-            # Скачиваем через tarball_url релиза
-            tarball_url = data.get("tarball_url")
+            # zapret2 публикует asset zapret2-vX.X.X.tar.gz в releases
+            # внутри которого бинарники в binaries/linux-<arch>/nfqws2
+            assets = data.get("assets", [])
+            tarball_url = next(
+                (a["browser_download_url"] for a in assets if a["name"].endswith(".tar.gz")),
+                None
+            ) or data.get("tarball_url")
             if not tarball_url:
-                print(f"  ⚠  tarball_url не найден в релизе zapret2")
+                print(f"  ⚠  Не найден .tar.gz в релизе zapret2")
+                print(f"       Assets: {[a['name'] for a in assets]}")
                 _zapret_manual_hint()
                 return None
 
             tag = data.get("tag_name", "?")
-            print(f"  ⬇  Скачиваю zapret2 {tag} (source+binaries tarball) ...", flush=True)
-            req2 = urllib.request.Request(tarball_url, headers=headers)
+            print(f"  ⬇  Скачиваю zapret2 {tag}: {tarball_url.split('/')[-1]} ...", flush=True)
+            req2 = urllib.request.Request(tarball_url, headers={"User-Agent": "AegisNET-Admin/1.0"})
             with urllib.request.urlopen(req2, timeout=120) as r:
                 raw = r.read()
             print(f"  [i]  Скачано {len(raw):,} байт", flush=True)
