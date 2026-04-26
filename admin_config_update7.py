@@ -1580,75 +1580,80 @@ def _find_or_download_zapret() -> Optional[str]:
                 None
             )
         else:
-            # Linux/Debian: use zapret2 releases — pick nfqws2-linux-x86_64 or arm64
+            # Linux/Debian: zapret2 releases contain source+binaries as tarball_url.
+            # GitHub assets[] is empty — бинарники внутри source archive в binaries/linux-<arch>/
             req = urllib.request.Request(ZAPRET2_RELEASES_URL, headers=headers)
             with urllib.request.urlopen(req, timeout=20) as r:
                 data = json.loads(r.read())
 
             machine = _platform_mod.machine().lower()
             if "aarch64" in machine or "arm64" in machine:
-                arch_kw = "arm64"
+                arch_dir = "linux-arm64"
             elif "arm" in machine:
-                arch_kw = "arm"
+                arch_dir = "linux-arm"
             else:
-                arch_kw = "x86_64"
+                arch_dir = "linux-x86_64"
 
-            # zapret2 releases naming: nfqws2-linux-x86_64, nfqws2-linux-arm64, etc.
-            asset_url = next(
-                (a["browser_download_url"] for a in data.get("assets", [])
-                 if "nfqws2" in a["name"].lower() and "linux" in a["name"].lower()
-                 and arch_kw in a["name"].lower()),
-                None
-            )
-            # Fallback: any linux asset
-            if not asset_url:
-                asset_url = next(
-                    (a["browser_download_url"] for a in data.get("assets", [])
-                     if "linux" in a["name"].lower() and "nfqws2" in a["name"].lower()),
+            # zapret2 пакует бинарники внутрь source tarball: binaries/<arch>/nfqws2
+            # Скачиваем через tarball_url релиза
+            tarball_url = data.get("tarball_url")
+            if not tarball_url:
+                print(f"  ⚠  tarball_url не найден в релизе zapret2")
+                _zapret_manual_hint()
+                return None
+
+            tag = data.get("tag_name", "?")
+            print(f"  ⬇  Скачиваю zapret2 {tag} (source+binaries tarball) ...", flush=True)
+            req2 = urllib.request.Request(tarball_url, headers=headers)
+            with urllib.request.urlopen(req2, timeout=120) as r:
+                raw = r.read()
+            print(f"  [i]  Скачано {len(raw):,} байт", flush=True)
+
+            base.mkdir(parents=True, exist_ok=True)
+
+            # Распаковываем только нужный бинарник и lua/
+            with _tarfile.open(fileobj=_io.BytesIO(raw), mode="r:gz") as tf:
+                members = tf.getmembers()
+                # Путь внутри архива: <repo-tag>/binaries/<arch>/nfqws2
+                bin_member = next(
+                    (m for m in members
+                     if f"binaries/{arch_dir}/nfqws2" in m.name and m.isfile()),
                     None
                 )
+                # Fallback: любой nfqws2 для linux
+                if not bin_member:
+                    bin_member = next(
+                        (m for m in members
+                         if "binaries/linux" in m.name and m.name.endswith("/nfqws2") and m.isfile()),
+                        None
+                    )
+                if not bin_member:
+                    print(f"  ⚠  nfqws2 не найден в архиве. Доступные binaries:")
+                    for m in members:
+                        if "binaries/" in m.name and m.isfile():
+                            print(f"       {m.name}")
+                    _zapret_manual_hint()
+                    return None
 
-        if not asset_url:
-            _zapret_manual_hint()
-            return None
+                print(f"  [i]  Извлекаю {bin_member.name} → core/zapret/nfqws2", flush=True)
+                f = tf.extractfile(bin_member)
+                dest = base / "nfqws2"
+                dest.write_bytes(f.read())
+                dest.chmod(0o755)
 
-        fname = asset_url.split("/")[-1]
-        print(f"  ⬇  Downloading {fname} ...", flush=True)
-        req2 = urllib.request.Request(asset_url, headers={"User-Agent": "AegisNET-Admin/1.0"})
-        with urllib.request.urlopen(req2, timeout=120) as r:
-            raw = r.read()
+                # Извлекаем lua/ скрипты
+                lua_dest = base / "lua"
+                lua_dest.mkdir(exist_ok=True)
+                for m in members:
+                    if "/lua/" in m.name and m.name.endswith(".lua") and m.isfile():
+                        lua_file = lua_dest / Path(m.name).name
+                        lf = tf.extractfile(m)
+                        if lf:
+                            lua_file.write_bytes(lf.read())
+                print(f"  [OK] lua scripts → {lua_dest}", flush=True)
 
-        base.mkdir(parents=True, exist_ok=True)
-
-        if fname.endswith(".zip"):
-            with _zipfile.ZipFile(_io.BytesIO(raw)) as zf:
-                zf.extractall(base)
-        else:
-            with _tarfile.open(fileobj=_io.BytesIO(raw)) as tf:
-                tf.extractall(base)
-
-        # Also try to grab lua/ scripts from zapret2 repo (needed by nfqws2)
-        if not is_win:
-            _zapret2_fetch_lua(base, data)
-
-        # Re-check
-        if is_win:
-            to_check = ["winws2.exe", "winws.exe"]
-        else:
-            to_check = ["nfqws2", "winws2", "nfqws"]
-
-        for name in to_check:
-            found_list = list(base.rglob(name))
-            if found_list:
-                exe = found_list[0]
-                if not is_win:
-                    exe.chmod(0o755)
-                print(f"  [OK] zapret2 extracted: {exe}")
-                return str(exe)
-
-        print("  ⚠  zapret2: binary not found after extraction")
-        _zapret_manual_hint()
-        return None
+            print(f"  [OK] zapret2 готов: {dest}")
+            return str(dest)
 
     except Exception as e:
         print(f"  ⚠  zapret2 download failed: {e}")
