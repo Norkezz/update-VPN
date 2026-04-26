@@ -1,0 +1,34 @@
+# ─────────────────────────────────────────────────────────
+# admin_config_update.py — зависимости
+# Установка: pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────
+
+# ── Сам скрипт (admin_config_update.py) ──────────────────
+# Шифрование cfg_ptr.bin и конфигов
+cryptography>=41.0.0
+# HTTP-запросы при проверке конфигов через xray (check/diag)
+requests>=2.31.0
+
+# ── keysconf.com парсер ───────────────────────────────────
+# Использует только стандартную библиотеку (urllib, threading, re)
+# Дополнительных пакетов НЕ требует.
+
+# ── urls_base (87 GitHub URL) ─────────────────────────────
+# Использует только стандартную библиотеку (urllib, ThreadPoolExecutor)
+# Дополнительных пакетов НЕ требует.
+
+# ── kort0881/vpn-vless-configs-russia (main.py) ──────────
+aiohttp>=3.9.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+python-dotenv>=1.0.0
+
+# ── mahdibland/V2RayAggregator (utils/list_merge.py) ─────
+PyYAML>=6.0.1
+
+# ── Epodonios/v2ray-configs (Files/app.py) ───────────────
+# Использует requests + beautifulsoup4 (уже выше)
+
+cloudscraper
+geoip64
+
