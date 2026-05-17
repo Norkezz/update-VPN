@@ -6033,7 +6033,6 @@ Adds:
 Designed to integrate into the existing project.
 """
 
-from __future__ import annotations
 
 import asyncio
 import hashlib
