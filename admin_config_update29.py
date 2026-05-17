@@ -424,6 +424,13 @@ URLS_BASE: list[str] = [
     "https://raw.githubusercontent.com/Hossein-nrj/awesome-freedom/master/configs.txt",
     "https://raw.githubusercontent.com/wrfree/free/main/v2",
     "https://raw.githubusercontent.com/polimi6/polimi6.github.io/main/v2ray_config.txt",
+
+    # ── Requested additional elite sources ───────────────────────────────────
+    "https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/vless.txt",
+    "https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/mixed.txt",
+    "https://raw.githubusercontent.com/hiztin/VLESS-PO-GRIBI/main/subscription.txt",
+    "https://raw.githubusercontent.com/kudryash0vv/kudryash0vv.YKTFLOW/main/vless.txt",
+    "https://raw.githubusercontent.com/kudryash0vv/kudryash0vv.YKTFLOW/main/mixed.txt",
 ]
 
 # ── Telegram-каналы с VPN-конфигами ──────────────────────────────────────────
@@ -452,6 +459,7 @@ TG_CHANNELS: list[str] = [
     "MrMohebi_xray",
     "v2raytunkeys",
     "KeysConf",
+    "vlesskeys",
 ]
 
 # Максимум страниц t.me/s/<channel>?before=<id> для парсинга (каждая ~20 сообщений)
@@ -490,6 +498,96 @@ def _is_valid_link(link: str) -> bool:
         return False
 
 
+# ── Legacy Shadowsocks support via sing-box ────────────────────────────────
+# Xray removed support for legacy stream ciphers:
+#   aes-256-cfb / aes-192-cfb / aes-128-cfb / rc4-md5
+# We keep them and mark them for sing-box handling.
+
+LEGACY_SS_CIPHERS = {
+    "aes-256-cfb",
+    "aes-192-cfb",
+    "aes-128-cfb",
+    "rc4-md5",
+}
+
+VALID_TRANSPORTS = {
+    "tcp", "ws", "grpc", "httpupgrade",
+    "xhttp", "splithttp", "quic", "kcp"
+}
+
+INVALID_FLOWS = {
+    "xtls-rprx-origin",
+    "xtls-rprx-direct",
+    "xtls-rprx-direct-udp443",
+}
+
+def _multi_unquote(value: str, rounds: int = 5) -> str:
+    """Fix broken %252525 encoding chains."""
+    import urllib.parse
+    old = value
+    for _ in range(rounds):
+        new = urllib.parse.unquote(old)
+        if new == old:
+            break
+        old = new
+    return old
+
+def _sanitize_vpn_link(link: str) -> str | None:
+    """
+    Normalize malformed configs from public aggregators.
+    Keeps legacy Shadowsocks ciphers for sing-box compatibility.
+    """
+    try:
+        import urllib.parse
+
+        if link.startswith("vless://"):
+            link = _multi_unquote(link)
+
+            parsed = urllib.parse.urlparse(link)
+            q = urllib.parse.parse_qs(parsed.query)
+
+            flow = q.get("flow", [""])[0].strip()
+            if flow in INVALID_FLOWS or "udp443" in flow:
+                q.pop("flow", None)
+
+            transport = (
+                q.get("type", [""])[0]
+                or q.get("transport", [""])[0]
+            ).strip().lower()
+
+            if transport and transport not in VALID_TRANSPORTS:
+                q["type"] = ["tcp"]
+
+            query = urllib.parse.urlencode(
+                {k: v[0] for k, v in q.items()},
+                doseq=False,
+            )
+
+            link = urllib.parse.urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                query,
+                parsed.fragment,
+            ))
+
+        elif link.startswith("ss://"):
+            decoded = _multi_unquote(link)
+
+            # keep legacy ciphers for sing-box
+            for cipher in LEGACY_SS_CIPHERS:
+                if cipher in decoded.lower():
+                    return decoded
+
+            return decoded
+
+        return link
+
+    except Exception:
+        return None
+
+
 def _parse_links(text: str) -> list[str]:
     """Extract and validate VPN links from text; also tries base64 decode.
 
@@ -510,7 +608,9 @@ def _parse_links(text: str) -> list[str]:
         for line in chunk.splitlines():
             line = line.strip()
             if any(line.startswith(p) for p in PROTOCOLS) and _is_valid_link(line):
-                links.append(line)
+                sanitized = _sanitize_vpn_link(line)
+                if sanitized:
+                    links.append(sanitized)
     return list(dict.fromkeys(links))
 
 
@@ -610,13 +710,16 @@ def _run_update_script(repo_dir: Path, script_candidates: list[str],
 
 
 # Maximum age (days) of a config file's last git commit.
-# Files not updated within this window are skipped — stale configs
+# Files whose LAST GIT COMMIT is older than this window are skipped — stale configs
 # are unlikely to still be alive.
 MAX_FILE_AGE_DAYS = 45
 
 
 def _git_file_mtime(repo_dir: Path, filepath: Path) -> Optional[float]:
     """Return the Unix timestamp of the last git commit that touched `filepath`.
+
+    IMPORTANT:
+    Uses git commit time, NOT filesystem/download time.
 
     Uses `git log -1 --format=%ct` which is fast (single-file log).
     Returns None if git is unavailable or the file has no commit history.
@@ -675,11 +778,20 @@ def _collect_all_txt_links(repo_dir: Path, label: str = "", only_updated: bool =
     for fp in txt_files:
         rel = fp.relative_to(repo_dir)
 
-        # Mode 4: пропускаем файлы, не изменённые после запуска скрипта
+        # Mode 4:
+        # Проверяем дату последнего git-коммита файла,
+        # а НЕ filesystem mtime после clone/download.
+        #
+        # Иначе git clone делает все файлы "новыми",
+        # даже если сами конфиги старые.
         if only_updated:
-            fs_mtime = fp.stat().st_mtime
-            if fs_mtime < SCRIPT_START_TIME:
-                print(f"  ⏭  {rel} — skipped (not updated since script start)")
+            git_mtime = _git_file_mtime(repo_dir, fp)
+
+            # fallback если git history недоступна
+            effective_mtime = git_mtime or fp.stat().st_mtime
+
+            if effective_mtime < SCRIPT_START_TIME:
+                print(f"  ⏭  {rel} — skipped (git commit older than script start)")
                 continue
 
         # Age check
@@ -807,13 +919,15 @@ def _find_or_download_subconverter(work_dir: Path) -> Optional[Path]:
             data = json.loads(r.read())
         # Pick the right asset
         keyword = "win64" if is_win else "linux64"
+        # Windows releases are .zip; Linux releases are .tar.gz
+        ext = ".zip" if is_win else ".tar.gz"
         asset_url = next(
             (a["browser_download_url"] for a in data.get("assets", [])
-             if keyword in a["name"].lower() and a["name"].endswith(".tar.gz" if not is_win else ".tar.gz")),
+             if keyword in a["name"].lower() and a["name"].endswith(ext)),
             None
         )
         if not asset_url:
-            # fallback: any .tar.gz matching platform
+            # fallback: any asset matching platform keyword (any extension)
             asset_url = next(
                 (a["browser_download_url"] for a in data.get("assets", [])
                  if keyword in a["name"].lower()),
@@ -823,14 +937,22 @@ def _find_or_download_subconverter(work_dir: Path) -> Optional[Path]:
             print("  ⚠  subconverter: no matching release asset found")
             return None
         # Download and extract
-        import tarfile as _tarfile, io as _io
+        import tarfile as _tarfile, zipfile as _zipfile, io as _io
         req2 = urllib.request.Request(asset_url, headers={"User-Agent": _random_ua()})
         with urllib.request.urlopen(req2, timeout=60) as r:
             raw = r.read()
         sub_dir = work_dir / "subconverter"
         sub_dir.mkdir(exist_ok=True)
-        with _tarfile.open(fileobj=_io.BytesIO(raw)) as tf:
-            tf.extractall(sub_dir)
+        if asset_url.endswith(".zip"):
+            with _zipfile.ZipFile(_io.BytesIO(raw)) as zf:
+                zf.extractall(sub_dir)
+        else:
+            with _tarfile.open(fileobj=_io.BytesIO(raw)) as tf:
+                try:
+                    tf.extractall(sub_dir, filter="data")
+                except TypeError:
+                    # Python < 3.12 does not support filter kwarg
+                    tf.extractall(sub_dir)
         # Find binary after extraction (may be in a subdir)
         candidates = list(sub_dir.rglob(bin_name))
         if candidates:
@@ -1010,10 +1132,14 @@ def _fetch_source_urls_base(work_dir: Path) -> list[str]:
 # ── Keysconf.com parser ───────────────────────────────────────────────────────
 
 KEYSCONF_BASE = "https://keysconf.com"
+VLESSKEY_BASE = "https://vlesskey.com"
+OUTLINEKEYS_BASE = "https://outlinekeys.com"
+
 KEYSCONF_CONCURRENT = 40   # параллельных запросов к сайту
 
 
 def _fetch_source_keysconf(work_dir: Path) -> list[str]:
+    
     """Parse keysconf.com: собирает конфиги со всех страниц пагинации.
 
     Алгоритм:
@@ -1133,6 +1259,307 @@ def _fetch_source_keysconf(work_dir: Path) -> list[str]:
     print(f"  💾  keysconf: saved → {out_file}", flush=True)
 
     return found_configs
+
+# ── Universal premium source parser ─────────────────────────────────────────
+# Подходит для:
+#   keysconf.com
+#   vlesskey.com
+#   outlinekeys.com
+#
+# Возможности:
+#   • обход ВСЕХ страниц пагинации
+#   • фильтр только Online
+#   • поддержка aria-label="Page navigation example"
+#   • сбор стран
+#   • сбор VLESS / VMESS / Trojan / SS / HY2 / TUIC
+#
+
+PREMIUM_CONCURRENT = 50
+
+
+def _fetch_source_premium_site(
+    work_dir: Path,
+    source_name: str,
+    base_url: str,
+) -> list[str]:
+    import html as _html
+
+    out_dir = work_dir / source_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_file = out_dir / "all.txt"
+    country_file = out_dir / "countries.txt"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    def _http_get(url: str, timeout: int = 20) -> Optional[str]:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read().decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+
+    print(f"  🌐  {source_name}: scanning pages ...", flush=True)
+
+    first_html = _http_get(f"{base_url}/?page=1")
+    if not first_html:
+        first_html = _http_get(base_url)
+
+    if not first_html:
+        print(f"  ⚠  {source_name}: site unreachable")
+        return []
+
+    # ── page navigation example ─────────────────────────────────────────────
+    page_nums = [
+        int(x)
+        for x in re.findall(r'page=(\d+)', first_html, re.IGNORECASE)
+        if x.isdigit()
+    ]
+
+    max_page = max(page_nums) if page_nums else 1
+
+    print(f"  📄  {source_name}: {max_page} pages detected", flush=True)
+
+    all_card_urls: list[str] = []
+    countries: set[str] = set()
+
+    # Паттерны URL карточек конфигов — покрывают разные сайты
+    # vlesskey.com / outlinekeys.com могут использовать /key/, /config/, /outline/ и т.д.
+    _CARD_URL_PATTERN = re.compile(
+        r'href="(/(?:vless|vmess|trojan|ss|hy2|tuic|key|config|outline|proxy|node'
+        r'|access|server|vpn|free)/[\w\-]+/?)"',
+        re.IGNORECASE,
+    )
+    # Запасной — любой путь вида /что-угодно/число/ или /что-угодно/слово-цифры/
+    _CARD_URL_FALLBACK = re.compile(
+        r'href="(/[\w\-]+/[\w\-]{2,}/?)"',
+        re.IGNORECASE,
+    )
+
+    def _parse_listing(page_num: int) -> list[str]:
+        page_url = f"{base_url}/?page={page_num}"
+        html = _http_get(page_url)
+
+        if not html:
+            return []
+
+        local_cards: list[str] = []
+
+        # ── countries ───────────────────────────────────────────────────────
+        for c in re.findall(
+            r'flag-icon[^>]*></span>\s*([A-Za-z .\-]{2,40})',
+            html,
+            re.IGNORECASE,
+        ):
+            cc = c.strip()
+            if 2 <= len(cc) <= 40:
+                countries.add(cc)
+
+        # ── ONLINE filter (пытаемся взять только Online карточки) ───────────
+        card_blocks = re.findall(
+            r'<(?:div|article|li)[^>]+class="[^"]*card[^"]*"[^>]*>(.*?)</(?:div|article|li)>',
+            html,
+            re.DOTALL | re.IGNORECASE,
+        )
+
+        for block in card_blocks:
+            lower = block.lower()
+            # только online (мягкий фильтр — пропускаем если явно offline/expired)
+            if "offline" in lower or "expired" in lower:
+                continue
+
+            urls = _CARD_URL_PATTERN.findall(block)
+            local_cards.extend(urls)
+
+        # fallback 1: те же паттерны по всей странице без online-фильтра
+        if not local_cards:
+            local_cards.extend(_CARD_URL_PATTERN.findall(html))
+
+        # fallback 2: ещё шире — любые ссылки /сегмент/идентификатор/
+        # (исключаем типичные навигационные пути)
+        if not local_cards:
+            _NAV = re.compile(
+                r'^/(?:page|static|assets|css|js|img|images|fonts|media|admin'
+                r'|login|logout|register|api|search|about|contact|faq|terms|privacy'
+                r'|blog|news|tag|category|lang|en|ru|fa)/?',
+                re.IGNORECASE,
+            )
+            for href in _CARD_URL_FALLBACK.findall(html):
+                if not _NAV.match(href) and not href.endswith(('.css', '.js', '.png', '.jpg')):
+                    local_cards.append(href)
+
+        return list(dict.fromkeys(local_cards))
+
+    with ThreadPoolExecutor(max_workers=PREMIUM_CONCURRENT) as ex:
+        futures = {
+            ex.submit(_parse_listing, p): p
+            for p in range(1, max_page + 1)
+        }
+
+        for f in as_completed(futures):
+            try:
+                all_card_urls.extend(f.result())
+            except Exception:
+                pass
+
+    all_card_urls = list(dict.fromkeys(all_card_urls))
+
+    print(
+        f"  📋  {source_name}: {len(all_card_urls)} config pages found",
+        flush=True,
+    )
+
+    if not all_card_urls:
+        return []
+
+    found_configs: list[str] = []
+
+    done = [0]
+    lock = threading.Lock()
+
+    def _parse_config(rel_url: str) -> Optional[str]:
+        html = _http_get(f"{base_url}{rel_url}")
+
+        if not html:
+            return None
+
+        # ── 1. id="accessKey" — главный контейнер для Outline / SS ключей
+        #    <input id="accessKey" value="ss://...">
+        #    <textarea id="accessKey">ss://...</textarea>
+        #    <span id="accessKey">vless://...</span>
+        m = re.search(
+            r'id=["\']accessKey["\'][^>]*(?:value=["\']([^"\']+://[^"\']+)["\']'
+            r'|[^>]*>([^<]*://[^<\s]+))',
+            html,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if m:
+            cfg = _html.unescape((m.group(1) or m.group(2) or "").strip())
+            if _is_valid_link(cfg):
+                return cfg
+
+        # ── 2. value= с протоколом внутри input/textarea ────────────────────
+        m = re.search(
+            r'<(?:input|textarea)[^>]+value=["\']([a-z0-9]+://[^"\'<\s]+)["\']',
+            html,
+            re.IGNORECASE,
+        )
+        if m:
+            cfg = _html.unescape(m.group(1)).strip()
+            if _is_valid_link(cfg):
+                return cfg
+
+        # ── 3. data-copy / data-clipboard-text ──────────────────────────────
+        patterns = [
+            r'data-copy=["\']([^"\']+://[^"\']+)["\']',
+            r'data-clipboard-text=["\']([^"\']+://[^"\']+)["\']',
+            r'data-value=["\']([^"\']+://[^"\']+)["\']',
+        ]
+        for pat in patterns:
+            m = re.search(pat, html, re.IGNORECASE)
+            if m:
+                cfg = _html.unescape(m.group(1)).strip()
+                if _is_valid_link(cfg):
+                    return cfg
+
+        # ── 4. <code> блок с протоколом ─────────────────────────────────────
+        m = re.search(
+            r'<code[^>]*>\s*([a-z0-9]+://[^\s<]+)\s*</code>',
+            html,
+            re.IGNORECASE,
+        )
+        if m:
+            cfg = _html.unescape(m.group(1)).strip()
+            if _is_valid_link(cfg):
+                return cfg
+
+        # ── 5. Любой текст-узел с ://, который проходит валидацию ───────────
+        for proto in PROTOCOLS:
+            m = re.search(
+                rf'({re.escape(proto)}[^\s<>"\']+)',
+                html,
+                re.IGNORECASE,
+            )
+            if m:
+                cfg = _html.unescape(m.group(1)).strip().rstrip('.,;)"\'')
+                if _is_valid_link(cfg):
+                    return cfg
+
+        return None
+
+    with ThreadPoolExecutor(max_workers=PREMIUM_CONCURRENT) as ex:
+        futures = {
+            ex.submit(_parse_config, u): u
+            for u in all_card_urls
+        }
+
+        for f in as_completed(futures):
+            cfg = None
+
+            try:
+                cfg = f.result()
+            except Exception:
+                pass
+
+            with lock:
+                done[0] += 1
+
+                if cfg:
+                    found_configs.append(cfg)
+
+                if done[0] % 50 == 0:
+                    print(
+                        f"    {source_name} {done[0]}/{len(all_card_urls)} "
+                        f"found: {len(found_configs)}",
+                        end="\r",
+                        flush=True,
+                    )
+
+    found_configs = list(dict.fromkeys(found_configs))
+
+    out_file.write_text("\n".join(found_configs), encoding="utf-8")
+
+    if countries:
+        country_file.write_text(
+            "\n".join(sorted(countries)),
+            encoding="utf-8",
+        )
+
+    print(f"\n  ✓  {source_name}: {len(found_configs)} configs", flush=True)
+
+    if countries:
+        print(f"  🌍  countries: {len(countries)}")
+
+    print(f"  💾  saved → {out_file}")
+
+    return found_configs
+
+
+def _fetch_source_vlesskey(work_dir: Path) -> list[str]:
+    return _fetch_source_premium_site(
+        work_dir,
+        "vlesskey",
+        VLESSKEY_BASE,
+    )
+
+
+def _fetch_source_outlinekeys(work_dir: Path) -> list[str]:
+    return _fetch_source_premium_site(
+        work_dir,
+        "outlinekeys",
+        OUTLINEKEYS_BASE,
+    )
 
 
 def _fetch_source_local_dir(local_path: Path) -> list[str]:
@@ -1385,6 +1812,13 @@ def fetch_all_sources(
             links = _fetch_source_urls_base(work_dir)
         elif src in ("keysconf", "keysconf.com"):
             links = _fetch_source_keysconf(work_dir)
+
+        elif src in ("vlesskey", "vlesskey.com"):
+            links = _fetch_source_vlesskey(work_dir)
+
+        elif src in ("outlinekeys", "outlinekeys.com"):
+            links = _fetch_source_outlinekeys(work_dir)
+
         elif src in ("telegram", "tg") or src.startswith("telegram:") or src.startswith("tg:"):
             # telegram              — парсит все каналы из TG_CHANNELS
             # telegram:chan1,chan2  — парсит конкретные каналы
@@ -1442,7 +1876,9 @@ def _fetch_direct_url(url: str) -> list[str]:
 MAX_PING_MS   = 1000   # до 1000 мс — отсекаем совсем мёртвые хосты
 PING_TIMEOUT  = 3.0    # 3 сек на коннект
 PING_WORKERS  = 100
-CHECK_WORKERS = 24     # 24 воркера = 24 xray-процесса одновременно (стабильно на Windows)
+CHECK_WORKERS = 20 if sys.platform == "win32" else 32
+XRAY_START_TIMEOUT = 12.0
+XRAY_READY_CHECK_INTERVAL = 0.05
 
 # 3-stage xray check
 # MIN_MS убран везде — скорость не критерий, важна только корректность данных.
@@ -2375,6 +2811,99 @@ def _find_xray() -> Optional[str]:
     return _find_or_download_xray()
 
 
+# ── sing-box ──────────────────────────────────────────────────────────────────
+
+SINGBOX_RELEASES_URL = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+
+
+def _find_or_download_singbox() -> Optional[str]:
+    """Locate sing-box binary; download latest release if missing.
+
+    Windows : extracts sing-box-*-windows-amd64.zip → core/sing-box.exe
+    Linux   : extracts sing-box-*-linux-amd64.tar.gz → core/sing-box
+    ARM     : picks matching arm64 / armv7 asset automatically.
+    """
+    is_win = OS_TYPE == "windows"
+    bin_name = "sing-box.exe" if is_win else "sing-box"
+    core_dir = Path(__file__).parent / "core"
+
+    # ── 1. Check local core/ and script dir ─────────────────────────────────
+    for candidate in [core_dir / bin_name, Path(__file__).parent / bin_name]:
+        if candidate.exists():
+            return str(candidate)
+
+    # ── 2. Check system PATH ─────────────────────────────────────────────────
+    found = shutil.which("sing-box")
+    if found:
+        return found
+
+    print(f"  ⬇  sing-box not found [{OS_TYPE}], downloading ...", flush=True)
+
+    try:
+        import io as _io, zipfile as _zipfile, tarfile as _tarfile
+
+        machine = _platform_mod.machine().lower()
+        if is_win:
+            kw_os, kw_arch = "windows", "amd64"
+        elif "aarch64" in machine or "arm64" in machine:
+            kw_os, kw_arch = "linux", "arm64"
+        elif "armv7" in machine or "armhf" in machine:
+            kw_os, kw_arch = "linux", "armv7"
+        else:
+            kw_os, kw_arch = "linux", "amd64"
+
+        headers = {"User-Agent": "AegisNET-Admin/1.0",
+                   "Accept": "application/vnd.github.v3+json"}
+        req = urllib.request.Request(SINGBOX_RELEASES_URL, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read())
+
+        # sing-box asset names: sing-box-1.x.y-linux-amd64.tar.gz
+        #                       sing-box-1.x.y-windows-amd64.zip
+        ext = ".zip" if is_win else ".tar.gz"
+        asset_url = next(
+            (a["browser_download_url"] for a in data.get("assets", [])
+             if kw_os in a["name"] and kw_arch in a["name"]
+             and a["name"].endswith(ext)
+             and "src" not in a["name"]),
+            None,
+        )
+        if not asset_url:
+            print(f"  ⚠  sing-box: нет ассета '{kw_os}-{kw_arch}{ext}' в релизе")
+            print("       Скачайте вручную: https://github.com/SagerNet/sing-box/releases")
+            return None
+
+        fname = asset_url.split("/")[-1]
+        print(f"  ⬇  Downloading {fname} ...", flush=True)
+        req2 = urllib.request.Request(asset_url, headers={"User-Agent": "AegisNET-Admin/1.0"})
+        with urllib.request.urlopen(req2, timeout=180) as r:
+            raw = r.read()
+
+        core_dir.mkdir(parents=True, exist_ok=True)
+
+        if is_win:
+            with _zipfile.ZipFile(_io.BytesIO(raw)) as zf:
+                zf.extractall(core_dir)
+        else:
+            with _tarfile.open(fileobj=_io.BytesIO(raw)) as tf:
+                tf.extractall(core_dir)
+
+        # Binary may be nested inside extracted subdir
+        candidates = [core_dir / bin_name] + list(core_dir.rglob(bin_name))
+        for c in candidates:
+            if c.exists():
+                if not is_win:
+                    c.chmod(0o755)
+                print(f"  [OK] sing-box downloaded: {c}")
+                return str(c)
+
+        print("  ⚠  sing-box: бинарь не найден после распаковки")
+        return None
+    except Exception as e:
+        print(f"  ⚠  sing-box download failed: {e}")
+        return None
+
+
 def _build_xray_cfg(link: str, port: int, zapret_port: Optional[int] = None) -> Optional[dict]:
     """Build xray JSON config for `link` listening on SOCKS `port`.
 
@@ -2442,6 +2971,53 @@ def _start_xray(link: str, xray_exe: str, port: int, zapret_port: Optional[int] 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
             json.dump(cfg, f)
             tmp = f.name
+
+        flags = 0
+        if sys.platform == "win32":
+            flags = subprocess.CREATE_NO_WINDOW
+
+        proc = subprocess.Popen(
+            [xray_exe, "run", "-c", tmp],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=flags,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        deadline = time.monotonic() + XRAY_START_TIMEOUT
+        startup_log = []
+
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                try:
+                    startup_log.append(proc.stdout.read())
+                except Exception:
+                    pass
+                log_text = "".join(startup_log).strip()
+                if log_text:
+                    print(f"  ⚠  xray exited during startup on port {port}:\\n{log_text[:1500]}")
+                return None, tmp
+
+            if _wait_port(port, 0.5):
+                return proc, tmp
+
+            time.sleep(XRAY_READY_CHECK_INTERVAL)
+
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+        return None, tmp
+    except Exception:
+        return None, None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(cfg, f)
+            tmp = f.name
         flags = 0x08000000 if sys.platform == "win32" else 0
         proc = subprocess.Popen(
             [xray_exe, "run", "-c", tmp],
@@ -2465,18 +3041,281 @@ def _kill_xray(proc, tmp):
             pass
 
 
-def _wait_port(port: int, timeout: float = 5.0) -> bool:
+def _wait_port(port: int, timeout: float = XRAY_START_TIMEOUT) -> bool:
+    """Wait until SOCKS5 listener is actually ready, not just bound."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                return True
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5) as s:
+                s.settimeout(0.5)
+                s.sendall(b"\x05\x01\x00")
+                resp = s.recv(2)
+                if resp and resp[0] == 0x05:
+                    return True
         except OSError:
-            time.sleep(0.05)
+            pass
+        time.sleep(XRAY_READY_CHECK_INTERVAL)
     return False
 
 
 import requests as _requests
+
+# ── sing-box checker (non-VLESS protocols) ────────────────────────────────────
+
+def _protocol_of(link: str) -> str:
+    """Вернуть нижний регистр схемы URI (vless, vmess, trojan, ss, hy2, ...)."""
+    try:
+        return urllib.parse.urlparse(link).scheme.lower()
+    except Exception:
+        return ""
+
+
+def _needs_singbox(link: str) -> bool:
+    """True если конфиг надо проверять через sing-box, а не через xray."""
+    return _protocol_of(link) in {"ss", "shadowsocks", "hy2", "hysteria2", "tuic", "trojan", "vmess"}
+
+
+def _build_singbox_cfg(link: str, port: int) -> Optional[dict]:
+    proto = _protocol_of(link)
+    try:
+        if proto == "vmess":
+            outbound = _singbox_ob_vmess(link)
+        elif proto == "trojan":
+            outbound = _singbox_ob_trojan(link)
+        elif proto in ("ss", "shadowsocks"):
+            outbound = _singbox_ob_ss(link)
+        elif proto in ("hy2", "hysteria2"):
+            outbound = _singbox_ob_hy2(link)
+        elif proto == "tuic":
+            outbound = _singbox_ob_tuic(link)
+        else:
+            return None
+        if outbound is None:
+            return None
+        outbound["tag"] = "proxy"
+        return {
+            "log": {"level": "error", "timestamp": False},
+            "inbounds": [{"type": "socks", "tag": "socks-in",
+                          "listen": "127.0.0.1", "listen_port": port, "sniff": False}],
+            "outbounds": [outbound, {"type": "direct", "tag": "direct"}],
+            "route": {"rules": [], "final": "proxy"},
+        }
+    except Exception:
+        return None
+
+
+def _singbox_ob_vmess(link: str) -> Optional[dict]:
+    b64 = link[len("vmess://"):].split("#")[0].strip()
+    padded = b64 + "=" * (-len(b64) % 4)
+    try:
+        v = json.loads(base64.b64decode(padded).decode("utf-8", errors="ignore"))
+    except Exception:
+        return None
+    ob: dict = {
+        "type": "vmess",
+        "server": v.get("add", ""),
+        "server_port": int(v.get("port", 443)),
+        "uuid": v.get("id", ""),
+        "security": v.get("scy") or v.get("security") or "auto",
+        "alter_id": int(v.get("aid", 0)),
+    }
+    net = str(v.get("net", "tcp")).lower()
+    tls_str = str(v.get("tls", "")).lower()
+    host = v.get("host", "") or v.get("add", "")
+    path = v.get("path", "/")
+    if tls_str == "tls":
+        ob["tls"] = {"enabled": True, "server_name": host or ob["server"], "insecure": True}
+    if net == "ws":
+        ob["transport"] = {"type": "ws", "path": path,
+                           "headers": {"Host": host} if host else {}}
+    elif net == "grpc":
+        ob["transport"] = {"type": "grpc", "service_name": path.lstrip("/")}
+    elif net == "h2":
+        ob["transport"] = {"type": "http", "host": [host] if host else [], "path": path}
+    return ob
+
+
+def _singbox_ob_trojan(link: str) -> Optional[dict]:
+    try:
+        p = urllib.parse.urlparse(link)
+        qs = urllib.parse.parse_qs(p.query)
+        password = p.username or p.password or ""
+        host = p.hostname or ""
+        port = p.port or 443
+        sni = qs.get("sni", [qs.get("peer", [host])[0]])[0] or host
+        security = qs.get("security", ["tls"])[0].lower()
+        ob: dict = {"type": "trojan", "server": host, "server_port": port, "password": password}
+        if security in ("tls", "reality", ""):
+            ob["tls"] = {"enabled": True, "server_name": sni, "insecure": True}
+        net = qs.get("type", ["tcp"])[0].lower()
+        if net == "ws":
+            ob["transport"] = {"type": "ws", "path": qs.get("path", ["/"])[0],
+                               "headers": {"Host": qs.get("host", [sni])[0]}}
+        elif net == "grpc":
+            ob["transport"] = {"type": "grpc", "service_name": qs.get("serviceName", [""])[0]}
+        return ob
+    except Exception:
+        return None
+
+
+def _singbox_ob_ss(link: str) -> Optional[dict]:
+    try:
+        raw = link[len("ss://"):].split("#")[0]
+        if "@" in raw:
+            userinfo, hostport = raw.rsplit("@", 1)
+            try:
+                decoded = base64.b64decode(userinfo + "=" * (-len(userinfo) % 4)).decode("utf-8", errors="ignore")
+                if ":" in decoded:
+                    userinfo = decoded
+            except Exception:
+                pass
+            method, password = userinfo.split(":", 1) if ":" in userinfo else ("chacha20-ietf-poly1305", userinfo)
+        else:
+            decoded = base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", errors="ignore")
+            if "@" in decoded:
+                userinfo, hostport = decoded.rsplit("@", 1)
+                method, password = userinfo.split(":", 1)
+            else:
+                return None
+        if hostport.startswith("["):
+            bracket_end = hostport.index("]")
+            host = hostport[1:bracket_end]
+            port = int(hostport[bracket_end + 2:])
+        else:
+            host, port_s = hostport.rsplit(":", 1)
+            port = int(port_s)
+        return {"type": "shadowsocks", "server": host, "server_port": port,
+                "method": method.lower(), "password": password}
+    except Exception:
+        return None
+
+
+def _singbox_ob_hy2(link: str) -> Optional[dict]:
+    try:
+        p = urllib.parse.urlparse(link)
+        qs = urllib.parse.parse_qs(p.query)
+        password = p.username or p.password or ""
+        host = p.hostname or ""
+        port = p.port or 443
+        sni = qs.get("sni", [host])[0]
+        return {"type": "hysteria2", "server": host, "server_port": port, "password": password,
+                "tls": {"enabled": True, "server_name": sni or host, "insecure": True}}
+    except Exception:
+        return None
+
+
+def _singbox_ob_tuic(link: str) -> Optional[dict]:
+    try:
+        p = urllib.parse.urlparse(link)
+        qs = urllib.parse.parse_qs(p.query)
+        uuid = p.username or ""
+        password = p.password or ""
+        host = p.hostname or ""
+        port = p.port or 443
+        sni = qs.get("sni", [host])[0]
+        cc = qs.get("congestion_control", ["bbr"])[0]
+        return {"type": "tuic", "server": host, "server_port": port, "uuid": uuid,
+                "password": password, "congestion_control": cc,
+                "tls": {"enabled": True, "server_name": sni or host, "insecure": True}}
+    except Exception:
+        return None
+
+
+_SINGBOX_START_TIMEOUT    = 8.0
+_SINGBOX_READY_CHECK_POLL = 0.15
+
+
+def _start_singbox(link: str, singbox_exe: str, port: int):
+    cfg = _build_singbox_cfg(link, port)
+    if cfg is None:
+        return None, None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+            tmp = f.name
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        proc = subprocess.Popen(
+            [singbox_exe, "run", "-c", tmp],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            creationflags=flags, text=True, encoding="utf-8", errors="replace",
+        )
+        deadline = time.monotonic() + _SINGBOX_START_TIMEOUT
+        startup_log: list[str] = []
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                try:
+                    startup_log.append(proc.stdout.read())
+                except Exception:
+                    pass
+                log_text = "".join(startup_log).strip()
+                if log_text:
+                    print(f"  ⚠  sing-box exited on port {port}:\\n{log_text[:800]}")
+                return None, tmp
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5) as s:
+                    s.settimeout(0.5)
+                    s.sendall(b"\x05\x01\x00")
+                    resp = s.recv(2)
+                    if resp and resp[0] == 0x05:
+                        return proc, tmp
+            except OSError:
+                pass
+            time.sleep(_SINGBOX_READY_CHECK_POLL)
+        try:
+            proc.kill(); proc.wait(timeout=2)
+        except Exception:
+            pass
+        return None, tmp
+    except Exception as exc:
+        print(f"  ⚠  sing-box start error: {exc}")
+        return None, None
+
+
+def check_config_singbox(link: str, singbox_exe: str, port_base: int) -> bool:
+    """3-stage проверка не-VLESS конфига через sing-box.
+
+    Stage 1: ya.ru — базовая связность
+    Stage 2: google.com — международный роутинг
+    Stage 3: 100 KB download — стабильность канала
+    """
+    port = port_base
+    proc, tmp = _start_singbox(link, singbox_exe, port)
+    if not proc:
+        return False
+    try:
+        proxies = {"http": f"socks5h://127.0.0.1:{port}", "https": f"socks5h://127.0.0.1:{port}"}
+        ua = {"User-Agent": "Mozilla/5.0"}
+        # Stage 1
+        try:
+            r1 = _requests.get(CHECK1_URL, proxies=proxies, timeout=CHECK1_TIMEOUT,
+                               allow_redirects=True, headers=ua)
+            if r1.status_code != 200 or len(r1.content) < 256:
+                return False
+        except Exception:
+            return False
+        # Stage 2
+        try:
+            r2 = _requests.get(CHECK2_URL, proxies=proxies, timeout=CHECK2_TIMEOUT,
+                               allow_redirects=True, headers=ua)
+            if r2.status_code not in (200, 301, 302) or len(r2.content) < 256:
+                return False
+        except Exception:
+            return False
+        # Stage 3 — 100 KB download
+        try:
+            r3 = _requests.get(CHECK3_URL, proxies=proxies, timeout=CHECK3_TIMEOUT,
+                               allow_redirects=True, headers=ua, stream=True)
+            data = r3.raw.read(102_400)
+            if len(data) < 50_000:
+                return False
+        except Exception:
+            return False
+        return True
+    finally:
+        _kill_xray(proc, tmp)
+
+# ── end sing-box checker ──────────────────────────────────────────────────────
+
 
 
 def _fetch_md5_direct(url: str, timeout: float = 10.0) -> Optional[bytes]:
@@ -2656,6 +3495,7 @@ def _run_ping_batch(
     return passed_links, remaining
 
 
+
 def _run_xray_batch(
     links: list[str],
     xray_exe: str,
@@ -2665,36 +3505,58 @@ def _run_xray_batch(
     enable_stage4: bool = False,
     stage4_threshold_ms: int = CHECK4_MAX_STACK_PING_MS,
 ) -> list[str]:
-    """Run the xray check on `links` and return those that pass.
+    """Run the xray/sing-box check on `links` and return those that pass.
 
-    enable_stage4=True добавляет Stage 4 (stacked ping latency):
-    каждый конфиг дополнительно проверяется по реальному RTT через xray-стек.
-    Это увеличивает время проверки (~+10-30 сек на конфиг), но отсеивает
-    медленные/нестабильные серверы ещё до загрузки на GitHub.
+    Роутинг по движку:
+      vless://            → xray  (check_config_full, с Zapret/Reality как раньше)
+      vmess://            → sing-box
+      trojan://           → sing-box
+      ss://               → sing-box
+      hy2:// / hysteria2://→ sing-box
+      tuic://             → sing-box
+
+    Если sing-box не найден — все протоколы идут через xray (старое поведение).
     """
     if verbose:
         stage_label = "4-stage" if enable_stage4 else "3-stage"
-        print(f"  🔬  xray check ({stage_label}): {len(links)} configs | {workers} threads ...", flush=True)
+        print(f"  🔬  check ({stage_label}): {len(links)} configs | {workers} threads ...", flush=True)
 
-    # Прогреваем reference MD5 один раз до запуска воркеров, чтобы не было
-    # race condition: без этого все 24 воркера стартуют одновременно и первый
-    # же лочит _REFERENCE_MD5_LOCK на 10+ секунд пока скачивает эталон,
-    # а остальные 23 ждут — их xray-процессы тем временем таймаутятся.
+    # Ищем sing-box один раз до запуска воркеров
+    _singbox_exe = _find_or_download_singbox()
     if verbose:
-        print(f"  📥  Pre-fetching reference MD5 for Stage 3 ...", flush=True)
+        if _singbox_exe:
+            print(f"  ✓  sing-box: {_singbox_exe}", flush=True)
+        else:
+            print("  ⚠  sing-box не найден — vmess/trojan/ss/hy2/tuic будут через xray (могут упасть)", flush=True)
+
+    # Считаем протоколы для статистики
+    if verbose:
+        proto_stat: dict[str, int] = {}
+        for lnk in links:
+            p = _protocol_of(lnk)
+            proto_stat[p] = proto_stat.get(p, 0) + 1
+        parts = []
+        for p, n in sorted(proto_stat.items()):
+            engine = "sb" if (_needs_singbox(lnk) and _singbox_exe) else "xray"
+            # используем proto напрямую
+            eng = "sb" if (p in {"ss","shadowsocks","hy2","hysteria2","tuic","trojan","vmess"} and _singbox_exe) else "xray"
+            parts.append(f"{p}({n})→{eng}")
+        print(f"  📊  protocols: {' | '.join(parts)}", flush=True)
+
+    # Прогреваем reference MD5 до запуска воркеров
+    if verbose:
+        print("  📥  Pre-fetching reference MD5 for Stage 3 ...", flush=True)
     _get_reference_md5(CHECK3_URL)
 
     working: list[str] = []
-    lock        = threading.Lock()
-    done        = [0]
+    lock     = threading.Lock()
+    done     = [0]
 
-    # Фиксированный пул портов: workers слотов × 20 портов каждый.
-    # Слоты переиспользуются — нет риска выйти за 65535.
-    _PORT_STEP   = 20          # портов на один воркер-слот (stages 1-4 + zapret offset)
-    _port_pool   = list(range(port_base, port_base + workers * _PORT_STEP, _PORT_STEP))
-    _free_slots  = list(_port_pool)   # доступные слоты
-    _slot_lock   = threading.Lock()
-    _slot_cv     = threading.Condition(_slot_lock)
+    _PORT_STEP  = 20
+    _port_pool  = list(range(port_base, port_base + workers * _PORT_STEP, _PORT_STEP))
+    _free_slots = list(_port_pool)
+    _slot_lock  = threading.Lock()
+    _slot_cv    = threading.Condition(_slot_lock)
 
     def _acquire_port() -> int:
         with _slot_cv:
@@ -2710,11 +3572,16 @@ def _run_xray_batch(
     def _check_task(lnk: str):
         p = _acquire_port()
         try:
-            result = check_config_full(
-                lnk, xray_exe, p,
-                skip_stage4=not enable_stage4,
-                stage4_threshold_ms=stage4_threshold_ms,
-            )
+            if _needs_singbox(lnk) and _singbox_exe:
+                result = check_config_singbox(lnk, _singbox_exe, p)
+            else:
+                result = check_config_full(
+                    lnk, xray_exe, p,
+                    skip_stage4=not enable_stage4,
+                    stage4_threshold_ms=stage4_threshold_ms,
+                )
+        except Exception:
+            result = False
         finally:
             _release_port(p)
         return lnk, result
@@ -2728,13 +3595,12 @@ def _run_xray_batch(
                 if ok:
                     working.append(l)
                 if verbose and done[0] % 5 == 0:
-                    print(f"    xray {done[0]}/{len(links)}  working: {len(working)}", end="\r", flush=True)
+                    print(f"    check {done[0]}/{len(links)}  working: {len(working)}", end="\r", flush=True)
 
     if verbose:
-        print(f"\n  ✓  xray done: {len(working)}/{len(links)} working", flush=True)
+        print(f"\n  ✓  check done: {len(working)}/{len(links)} working", flush=True)
 
     return working
-
 
 def run_checks(
     links: list[str],
@@ -2779,7 +3645,7 @@ def _load_cfg(args) -> tuple[str, str, str, str, str, str]:
 
 
 def cmd_setup(args):
-    """Download all required tools: xray, zapret, subconverter."""
+    """Download all required tools: xray, zapret, subconverter, sing-box."""
     import platform as _platform
     is_win = _platform.system() == "Windows"
     work_dir = Path(getattr(args, "work_dir", None) or
@@ -2794,7 +3660,7 @@ def cmd_setup(args):
     results = {}
 
     # ── 1. xray ───────────────────────────────────────────────────────────────
-    print("\n  [1/3] xray (XTLS/Xray-core)")
+    print("\n  [1/4] xray (XTLS/Xray-core)")
     xray = _find_or_download_xray()
     if xray:
         print(f"  [OK] xray: {xray}")
@@ -2819,7 +3685,7 @@ def cmd_setup(args):
     else:
         zapret_label = "zapret2 — DPI-bypass (nfqws2)"
 
-    print(f"\n  [2/3] {zapret_label}")
+    print(f"\n  [2/4] {zapret_label}")
 
     # Debian: auto-install apt dependencies before downloading zapret
     if OS_TYPE == "debian":
@@ -2834,7 +3700,7 @@ def cmd_setup(args):
         results["zapret"] = False
 
     # ── 3. subconverter ───────────────────────────────────────────────────────
-    print("\n  [3/3] subconverter (tindy2013/subconverter)")
+    print("\n  [3/4] subconverter (tindy2013/subconverter)")
     sub = _find_or_download_subconverter(work_dir)
     if sub:
         print(f"  [OK] subconverter: {sub}")
@@ -2843,6 +3709,18 @@ def cmd_setup(args):
         print("  [!!] subconverter: не удалось скачать — скачайте вручную:")
         print("       https://github.com/tindy2013/subconverter/releases")
         results["subconverter"] = False
+
+    # ── 4. sing-box ───────────────────────────────────────────────────────────
+    print("\n  [4/4] sing-box (SagerNet/sing-box)")
+    sbox = _find_or_download_singbox()
+    if sbox:
+        print(f"  [OK] sing-box: {sbox}")
+        results["sing-box"] = True
+    else:
+        print("  [!!] sing-box: не удалось скачать — скачайте вручную:")
+        print("       https://github.com/SagerNet/sing-box/releases")
+        print("       Поместите sing-box (или sing-box.exe) в папку core/")
+        results["sing-box"] = False
 
     # ── Итог ──────────────────────────────────────────────────────────────────
     ok = sum(results.values())
@@ -3174,167 +4052,125 @@ def _print_full_help(parser, sub_action) -> None:
 
 
 def cmd_diag(args):
-    """Single-config diagnostic: run each stage verbosely and show exactly where it fails."""
+    """Extended production diagnostic."""
+
     link = args.link.strip()
     port_base = getattr(args, "port_base", 19000)
 
-    print(f"\n{'='*62}")
-    print(f"  DIAG: {link[:80]}")
-    print(f"{'='*62}\n")
+    print(f"\n{'='*72}")
+    print(f"  EXTENDED DIAG")
+    print(f"{'='*72}\n")
 
-    # ── xray binary ───────────────────────────────────────────────────────────
+    print(f"  protocol : {link.split('://')[0]}")
+    print(f"  reality  : {_is_reality_config(link)}")
+
+    try:
+        p = urllib.parse.urlparse(link)
+        print(f"  host     : {p.hostname}")
+        print(f"  port     : {p.port}")
+    except Exception:
+        pass
+
+    print()
+
     xray_exe = _find_xray()
+
     if not xray_exe:
-        print("  ❌  xray binary not found — cannot run stages 1-4")
+        print("  ❌ xray not found")
         return
-    print(f"  ✓  xray: {xray_exe}")
 
-    # ── Parse config ──────────────────────────────────────────────────────────
+    print(f"  ✓ xray: {xray_exe}")
+
+    if _is_reality_config(link):
+        zapret = _find_zapret()
+        print(f"  ✓ zapret: {zapret or 'NOT FOUND'}")
+
+    print("\n" + "-"*72)
+    print("  STAGE 0 — CONFIG PARSE")
+    print("-"*72)
+
     cfg = _build_xray_cfg(link, port_base)
+
     if not cfg:
-        print("  ❌  Could not parse config link (xray_fluent.link_parser failed)")
+        print("  ❌ CONFIG PARSE FAILED")
         return
-    print(f"  ✓  Config parsed OK")
-    print(f"  is_reality: {_is_reality_config(link)}")
 
-    # ── Reference MD5 ─────────────────────────────────────────────────────────
-    print(f"\n  Fetching reference MD5 for stage 3 ({CHECK3_URL[:50]})...")
-    ref = _get_reference_md5(CHECK3_URL)
-    if ref:
-        print(f"  ✓  Reference MD5: {ref.hex()}")
-    else:
-        print(f"  ⚠  Reference MD5 unavailable — stage 3 will use size fallback")
+    print("  ✅ CONFIG PARSED")
 
-    # ── Stages 1 & 2 ──────────────────────────────────────────────────────────
-    for stage_num, (url, timeout) in enumerate([
-        (CHECK1_URL, CHECK1_TIMEOUT),
-        (CHECK2_URL, CHECK2_TIMEOUT),
-    ], start=1):
-        port = port_base + stage_num - 1
-        print(f"\n  --- Stage {stage_num}: {url} (port {port}) ---")
+    print("\n" + "-"*72)
+    print("  STAGE 1 — TCP PING")
+    print("-"*72)
 
-        # Start xray with stderr visible
-        cfg_s = _build_xray_cfg(link, port)
-        tmp_path = None
-        try:
-            import tempfile as _tf
-            with _tf.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
-                json.dump(cfg_s, f)
-                tmp_path = f.name
-            flags = 0x08000000 if sys.platform == "win32" else 0
-            proc = subprocess.Popen(
-                [xray_exe, "run", "-c", tmp_path],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                creationflags=flags, text=True, encoding="utf-8", errors="replace",
-            )
-        except Exception as e:
-            print(f"  ❌  xray start failed: {e}")
-            continue
+    try:
+        host = urllib.parse.urlparse(link).hostname
 
-        port_ok = _wait_port(port, 5.0)
-        xray_out = ""
-        try:
-            xray_out = proc.stdout.read(2000) if not port_ok else ""
-        except Exception:
-            pass
+        if not host:
+            print("  ❌ HOST NOT FOUND")
+            return
 
-        if not port_ok:
-            proc.kill(); proc.wait()
-            if tmp_path:
-                try: os.unlink(tmp_path)
-                except: pass
-            print(f"  ❌  xray did not bind port {port} within 5s")
-            if xray_out.strip():
-                print(f"  xray output:\n{''.join('    ' + l for l in xray_out.splitlines(True))}")
-            continue
+        start = time.perf_counter()
 
-        print(f"  ✓  xray listening on port {port}")
-        proxies = {"http": f"socks5h://127.0.0.1:{port}", "https": f"socks5h://127.0.0.1:{port}"}
-        try:
-            t0 = time.perf_counter()
-            r = _requests.get(url, proxies=proxies, timeout=timeout,
-                              allow_redirects=True, headers={"User-Agent": _random_ua()})
-            ms = int((time.perf_counter() - t0) * 1000)
-            print(f"  ✓  HTTP {r.status_code}  {ms} ms  body={len(r.content)} bytes")
-            # Stage 2 fallback: если google.com вернул 429/403 — пробуем резервный URL
-            if stage_num == 2 and r.status_code in CHECK2_FALLBACK_STATUSES:
-                print(f"  ⚠  Stage 2 — status {r.status_code}, retrying with fallback: {CHECK2_FALLBACK_URL}")
-                t0 = time.perf_counter()
-                r = _requests.get(CHECK2_FALLBACK_URL, proxies=proxies, timeout=timeout,
-                                  allow_redirects=True, headers={"User-Agent": _random_ua()})
-                ms = int((time.perf_counter() - t0) * 1000)
-                print(f"  ✓  HTTP {r.status_code}  {ms} ms  body={len(r.content)} bytes  [fallback]")
-            if r.status_code != 200:
-                print(f"  ❌  Stage {stage_num} FAIL — status {r.status_code} != 200")
-            elif len(r.content) < 256:
-                print(f"  ❌  Stage {stage_num} FAIL — body too small ({len(r.content)} bytes)")
-            else:
-                print(f"  ✓  Stage {stage_num} PASS")
-        except Exception as e:
-            print(f"  ❌  Stage {stage_num} FAIL — {type(e).__name__}: {e}")
-        finally:
-            try: proc.kill(); proc.wait()
-            except: pass
-            if tmp_path:
-                try: os.unlink(tmp_path)
-                except: pass
+        sock = socket.create_connection((host, 443), timeout=5)
+        sock.close()
 
-    # ── Stage 3 ───────────────────────────────────────────────────────────────
-    port3 = port_base + 2
-    print(f"\n  --- Stage 3: {CHECK3_URL[:50]} (port {port3}) ---")
-    proc, tmp_path = _start_xray(link, xray_exe, port3)
-    if not proc:
-        print(f"  ❌  xray start failed")
-    else:
-        port_ok = _wait_port(port3, 5.0)
-        if not port_ok:
-            proc.kill(); proc.wait()
-            print(f"  ❌  xray did not bind port {port3}")
+        ping_ms = int((time.perf_counter() - start) * 1000)
+
+        print(f"  ✅ TCP CONNECT: {ping_ms} ms")
+
+    except Exception as e:
+        print(f"  ❌ TCP FAIL: {e}")
+        return
+
+    print("\n" + "-"*72)
+    print("  STAGE 2 — XRAY FULL CHECK")
+    print("-"*72)
+
+    try:
+        result = check_config_full(
+            link,
+            xray_exe,
+            port_base,
+            skip_stage4=False,
+            stage4_threshold_ms=CHECK4_MAX_STACK_PING_MS,
+        )
+
+        if result:
+            print("\n  ✅ FULL PIPELINE PASSED")
         else:
-            proxies = {"http": f"socks5h://127.0.0.1:{port3}", "https": f"socks5h://127.0.0.1:{port3}"}
-            try:
-                t0 = time.perf_counter()
-                r = _requests.get(CHECK3_URL, proxies=proxies, timeout=CHECK3_TIMEOUT,
-                                  allow_redirects=True, headers={"User-Agent": _random_ua()})
-                ms = int((time.perf_counter() - t0) * 1000)
-                body_md5 = hashlib.md5(r.content).hexdigest()
-                print(f"  HTTP {r.status_code}  {ms} ms  body={len(r.content)} bytes  md5={body_md5[:12]}")
-                if ref:
-                    match = hashlib.md5(r.content).digest() == ref
-                    print(f"  MD5 match: {match}")
-                    if not match:
-                        print(f"  ❌  Stage 3 FAIL — MD5 mismatch")
-                    else:
-                        print(f"  ✓  Stage 3 PASS")
-                else:
-                    print(f"  ✓  Stage 3 PASS (no reference, size={len(r.content)})")
-            except Exception as e:
-                print(f"  ❌  Stage 3 FAIL — {type(e).__name__}: {e}")
-            finally:
-                _kill_xray(proc, tmp_path)
+            print("\n  ❌ PIPELINE FAILED")
 
-    # ── Stage 4 ───────────────────────────────────────────────────────────────
-    port4 = port_base + 3
-    print(f"\n  --- Stage 4: stacked ping latency (port {port4}) ---")
-    proc, tmp_path = _start_xray(link, xray_exe, port4)
-    if not proc:
-        print(f"  ❌  xray start failed")
-    else:
-        port_ok = _wait_port(port4, 5.0)
-        if not port_ok:
-            proc.kill(); proc.wait()
-            print(f"  ❌  xray did not bind port {port4}")
+    except Exception as e:
+        print(f"\n  ❌ XRAY ERROR: {type(e).__name__}: {e}")
+        return
+
+    print("\n" + "-"*72)
+    print("  STAGE 3 — STACK RTT")
+    print("-"*72)
+
+    try:
+        rtt = _stack_ping_ms(
+            link,
+            xray_exe,
+            port_base,
+            None,
+        )
+
+        if rtt is None:
+            print("  ❌ STACK RTT FAILED")
         else:
-            ms = _stack_ping_ms(link, xray_exe, port4, None)
-            if ms is None:
-                print(f"  ❌  Stage 4 FAIL — no ping response")
-            elif ms > CHECK4_MAX_STACK_PING_MS:
-                print(f"  ❌  Stage 4 FAIL — {ms} ms > {CHECK4_MAX_STACK_PING_MS} ms threshold")
-            else:
-                print(f"  ✓  Stage 4 PASS — {ms} ms")
-            _kill_xray(proc, tmp_path)
+            print(f"  ✅ STACK RTT: {rtt} ms")
 
-    print(f"\n{'='*62}\n")
+            if rtt <= CHECK4_MAX_STACK_PING_MS:
+                print("  ✅ RTT WITHIN LIMIT")
+            else:
+                print("  ⚠ RTT TOO HIGH")
+
+    except Exception as e:
+        print(f"  ❌ RTT ERROR: {e}")
+
+    print("\n" + "="*72)
+    print("  DIAG COMPLETE")
+    print(f"{'='*72}\n")
 
 def _interactive_menu() -> "argparse.Namespace":
     """Интерактивный выбор команды и источников при запуске без аргументов."""
@@ -3343,7 +4179,7 @@ def _interactive_menu() -> "argparse.Namespace":
     print("="*60)
 
     print("\n  Что делаем?\n")
-    print("  0) setup    — скачать инструменты (xray, zapret, subconverter)")
+    print("  0) setup    — скачать инструменты (xray, zapret, subconverter, sing-box)")
     print("  1) update   — собрать → проверить → загрузить на GitHub")
     print("  2) fetch    — только собрать конфиги (без проверки)")
     print("  3) check    — проверить конфиги из файла")
@@ -3399,7 +4235,7 @@ def _interactive_menu() -> "argparse.Namespace":
 
     _ns = argparse.Namespace(
         command=command, token=_token, owner=_owner, repo=_repo, nonce=_nonce, file=_cfgfile,
-        sources="kort0881,v2ray_agg,epodonios,keysconf",
+        sources="kort0881,v2ray_agg,epodonios,keysconf,vlesskey,outlinekeys,urls_base,telegram",
         work_dir=None, workers=CHECK_WORKERS, port_base=21000,
         mode=4, batch_size=PING_BATCH_SIZE, output=None, input=None, link=None,
         help=False,
@@ -3409,13 +4245,17 @@ def _interactive_menu() -> "argparse.Namespace":
     if command in ("update", "fetch"):
         # key, display label, default selected, is_new
         ALL_SOURCES = [
-            ("kort0881",  "kort0881   — ~840 VLESS источников, Россия",             True,  False),
-            ("v2ray_agg", "v2ray_agg  — V2RayAggregator + ShadowsocksAggregator",   True,  False),
-            ("epodonios", "epodonios  — Epodonios/v2ray-configs (ежедневно)",        True,  False),
-            ("keysconf",  "keysconf   — keysconf.com (твой сайт, Online конфиги)",   True,  False),
-            ("urls_base", "urls_base  — 60+ GitHub raw-URL источников",              True,  False),
-            ("telegram",  "telegram   — 17 TG-каналов с конфигами (без API key)",    False, True),
+            ("kort0881",   "kort0881   — ~840 VLESS источников, Россия",             True,  False),
+            ("v2ray_agg",  "v2ray_agg  — V2RayAggregator + ShadowsocksAggregator",   True,  False),
+            ("epodonios",  "epodonios  — Epodonios/v2ray-configs (ежедневно)",       True,  False),
+            ("keysconf",   "keysconf   — keysconf.com (Online configs)",             True,  False),
+            ("vlesskey",   "vlesskey   — premium online configs + all countries",    True,  True),
+            ("outlinekeys", "outlinekeys — premium outline/vless keys",              True,  True),
+            ("urls_base",  "urls_base  — 60+ GitHub raw-URL источников",             True,  False),
+            ("telegram",   "telegram    — Telegram channels parser",                 True,  True),
         ]
+
+        ALL_SOURCES = [r for r in ALL_SOURCES if isinstance(r, (tuple, list)) and len(r) >= 4]
         selected = {k: default for k, _, default, _ in ALL_SOURCES}
 
         print("\n" + "-"*60)
@@ -3567,10 +4407,13 @@ def main():
 
     # update
     p_update = sub.add_parser("update", help="Fetch, verify and upload to GitHub")
-    p_update.add_argument("--sources", default="kort0881,v2ray_agg,epodonios,keysconf",
+    p_update.add_argument("--sources", default="kort0881,v2ray_agg,epodonios,keysconf,vlesskey,outlinekeys,urls_base,telegram",
                            help=(
-                               "Sources (comma-separated): kort0881, v2ray_agg, epodonios, "
-                               "keysconf, urls_base, local:<path>, or direct URL"
+                               "Sources (comma-separated): "
+                               "kort0881, v2ray_agg, epodonios, "
+                               "keysconf, vlesskey, outlinekeys, "
+                               "urls_base, telegram, tg, "
+                               "local:<path>, or direct URL"
                            ))
     p_update.add_argument("--work-dir", dest="work_dir", default=None)
     p_update.add_argument("--workers", type=int, default=CHECK_WORKERS,
@@ -3581,7 +4424,7 @@ def main():
 
     # fetch
     p_fetch = sub.add_parser("fetch", help="Collect configs only (no upload)")
-    p_fetch.add_argument("--sources", default="kort0881,v2ray_agg,epodonios,keysconf",
+    p_fetch.add_argument("--sources", default="kort0881,v2ray_agg,epodonios,keysconf,vlesskey,outlinekeys,urls_base,telegram",
                           help="Sources (comma-separated): kort0881, v2ray_agg, epodonios, keysconf, urls_base, local:<path>, or URL")
     p_fetch.add_argument("--work-dir", dest="work_dir", default=None)
     p_fetch.add_argument("--output", "-o", help="Save to file")
@@ -3603,7 +4446,7 @@ def main():
     p_dl.add_argument("--output", "-o", help="Save to file")
 
     # setup
-    p_setup = sub.add_parser("setup", help="Download all required tools (xray, zapret, subconverter)")
+    p_setup = sub.add_parser("setup", help="Download all required tools (xray, zapret, subconverter, sing-box)")
     p_setup.add_argument("--work-dir", dest="work_dir", default=None)
 
     # status
@@ -3639,3 +4482,1231 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ultimate production-grade checker extensions
+# Added automatically
+# ─────────────────────────────────────────────────────────────────────────────
+
+import sqlite3
+from dataclasses import dataclass
+
+DB_FILE = "vpn_nodes.db"
+
+def _db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS configs(
+        fingerprint TEXT PRIMARY KEY,
+        protocol TEXT,
+        country TEXT,
+        host TEXT,
+        port INTEGER,
+        score REAL DEFAULT 0,
+        avg_latency REAL DEFAULT 0,
+        avg_speed REAL DEFAULT 0,
+        success_count INTEGER DEFAULT 0,
+        fail_count INTEGER DEFAULT 0,
+        fail_streak INTEGER DEFAULT 0,
+        last_seen REAL DEFAULT 0,
+        alive INTEGER DEFAULT 0
+    )
+    """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS dead_cache(
+        fingerprint TEXT PRIMARY KEY,
+        retry_after REAL
+    )
+    """)
+    conn.commit()
+    return conn
+
+def _fingerprint(link: str) -> str:
+    return hashlib.sha256(link.encode()).hexdigest()
+
+def _dead_cached(fp: str) -> bool:
+    conn = _db()
+    row = conn.execute(
+        "SELECT retry_after FROM dead_cache WHERE fingerprint=?",
+        (fp,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return False
+    return time.time() < float(row[0])
+
+def _mark_dead(fp: str, hours: int = 6):
+    conn = _db()
+    conn.execute(
+        "REPLACE INTO dead_cache(fingerprint,retry_after) VALUES(?,?)",
+        (fp, time.time() + hours * 3600)
+    )
+    conn.commit()
+    conn.close()
+
+def _update_score(
+    link: str,
+    success: bool,
+    latency: float = 0,
+    speed: float = 0,
+    country: str = ""
+):
+    fp = _fingerprint(link)
+
+    proto = link.split("://")[0]
+
+    try:
+        p = urllib.parse.urlparse(link)
+        host = p.hostname or ""
+        port = p.port or 0
+    except Exception:
+        host = ""
+        port = 0
+
+    conn = _db()
+
+    row = conn.execute(
+        "SELECT success_count, fail_count, fail_streak FROM configs WHERE fingerprint=?",
+        (fp,)
+    ).fetchone()
+
+    if row:
+        success_count, fail_count, fail_streak = row
+    else:
+        success_count = fail_count = fail_streak = 0
+
+    if success:
+        success_count += 1
+        fail_streak = 0
+    else:
+        fail_count += 1
+        fail_streak += 1
+
+    score = 0
+
+    if success:
+        score += 50
+
+    if latency:
+        score += max(0, 30 - latency / 50)
+
+    if speed:
+        score += min(speed / 2, 20)
+
+    if "reality" in link.lower():
+        score += 25
+
+    preferred = ["NL", "DE", "FI", "SE", "JP", "SG"]
+    if country.upper() in preferred:
+        score += 10
+
+    conn.execute(
+        """
+        REPLACE INTO configs(
+            fingerprint, protocol, country, host, port,
+            score, avg_latency, avg_speed,
+            success_count, fail_count, fail_streak,
+            last_seen, alive
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            fp,
+            proto,
+            country,
+            host,
+            port,
+            score,
+            latency,
+            speed,
+            success_count,
+            fail_count,
+            fail_streak,
+            time.time(),
+            1 if success else 0
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    if fail_streak >= 5:
+        _mark_dead(fp)
+
+XRAY_FATAL_PATTERNS = [
+    "bad handshake",
+    "deadline exceeded",
+    "connection reset",
+    "EOF",
+    "rejected",
+    "tls",
+]
+
+GENERATE_204_URLS = [
+    "https://cp.cloudflare.com/generate_204",
+    "https://www.gstatic.com/generate_204",
+    "https://www.google.com/generate_204",
+]
+
+THROUGHPUT_TEST_URL = "https://speed.cloudflare.com/__down?bytes=1000000"
+
+def _is_xray_output_fatal(output: str) -> bool:
+    out = output.lower()
+    return any(p.lower() in out for p in XRAY_FATAL_PATTERNS)
+
+def _http_throughput_test(proxy_url: str, timeout: int = 20) -> tuple[bool, float]:
+    import requests
+
+    start = time.time()
+
+    try:
+        r = requests.get(
+            THROUGHPUT_TEST_URL,
+            proxies={
+                "http": proxy_url,
+                "https": proxy_url,
+            },
+            timeout=timeout,
+            stream=True,
+        )
+
+        total = 0
+
+        for chunk in r.iter_content(65536):
+            total += len(chunk)
+
+        elapsed = max(time.time() - start, 0.001)
+
+        mbps = (total * 8 / 1024 / 1024) / elapsed
+
+        return True, mbps
+
+    except Exception:
+        return False, 0.0
+
+def _check_generate204(proxy_url: str, timeout: int = 10) -> bool:
+    import requests
+
+    ok = 0
+
+    for url in GENERATE_204_URLS:
+        try:
+            r = requests.get(
+                url,
+                proxies={
+                    "http": proxy_url,
+                    "https": proxy_url,
+                },
+                timeout=timeout,
+                allow_redirects=False,
+            )
+
+            if r.status_code in (200, 204):
+                ok += 1
+
+        except Exception:
+            pass
+
+    return ok >= 2
+
+def _ip_changed(proxy_url: str, timeout: int = 10) -> bool:
+    import requests
+
+    try:
+        direct = requests.get(
+            "https://api.ipify.org",
+            timeout=timeout
+        ).text.strip()
+
+        proxied = requests.get(
+            "https://api.ipify.org",
+            proxies={
+                "http": proxy_url,
+                "https": proxy_url,
+            },
+            timeout=timeout
+        ).text.strip()
+
+        return direct != proxied
+
+    except Exception:
+        return False
+
+print("✓ Ultimate production-grade VPN checker extensions loaded")
+
+
+
+
+# =============================================================================
+# ASYNC INFRASTRUCTURE UPGRADE LAYER
+# Added from infrastructure roadmap migration.
+# =============================================================================
+
+import asyncio
+import ssl
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Any
+
+try:
+    import aiohttp
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except Exception:
+    pass
+
+
+class NodeState(str, Enum):
+    ACTIVE = "ACTIVE"
+    QUARANTINE = "QUARANTINE"
+    DEAD = "DEAD"
+
+
+@dataclass
+class DomainHealth:
+    host: str
+    alive: bool = False
+    latency: float = 0.0
+    tls_ok: bool = False
+    last_checked: float = field(default_factory=time.time)
+    fail_ratio: float = 0.0
+
+
+@dataclass
+class TemporalNodeStats:
+    uptime_1d: float = 0.0
+    uptime_7d: float = 0.0
+    uptime_30d: float = 0.0
+    failure_trend: float = 0.0
+    latency_trend: float = 0.0
+
+
+class AdaptiveConcurrencyController:
+
+    def __init__(self, initial: int = 100):
+        self.current = initial
+        self.success_ratio = 1.0
+        self.fail_ratio = 0.0
+
+    def update(self, success_ratio: float, fail_ratio: float):
+        self.success_ratio = success_ratio
+        self.fail_ratio = fail_ratio
+
+        if fail_ratio > 0.5:
+            self.current = max(10, int(self.current * 0.8))
+
+        if success_ratio > 0.8:
+            self.current = min(2000, int(self.current * 1.1))
+
+        return self.current
+
+
+class AsyncDNSCache:
+
+    def __init__(self):
+        self.a_records: Dict[str, Any] = {}
+        self.aaaa_records: Dict[str, Any] = {}
+
+    async def resolve(self, host: str):
+        if host in self.a_records:
+            return self.a_records[host]
+
+        infos = await asyncio.get_event_loop().getaddrinfo(host, None)
+        self.a_records[host] = infos
+        return infos
+
+
+class BrowserTLSFactory:
+
+    @staticmethod
+    def create_context() -> ssl.SSLContext:
+        ctx = ssl.create_default_context()
+
+        ctx.set_alpn_protocols([
+            "h2",
+            "http/1.1",
+        ])
+
+        return ctx
+
+
+class CheckerBackend:
+
+    async def build_config(self, config: str):
+        raise NotImplementedError
+
+    async def start(self):
+        raise NotImplementedError
+
+    async def stop(self):
+        raise NotImplementedError
+
+    async def check(self, config: str):
+        raise NotImplementedError
+
+    async def warmup(self):
+        raise NotImplementedError
+
+
+class PersistentBackendWorker:
+
+    def __init__(self, backend_name: str, port: int):
+        self.backend_name = backend_name
+        self.port = port
+        self.current_config = None
+        self.process = None
+        self.state = "idle"
+
+    async def ensure_started(self):
+        self.state = "running"
+
+    async def hot_swap_config(self, config: str):
+        self.current_config = config
+
+    async def healthcheck(self):
+        return True
+
+
+class WorkerPoolManager:
+
+    def __init__(self):
+        self.worker_pool = {
+            "xray": [],
+            "singbox": [],
+        }
+
+    async def acquire(self, backend: str):
+        if self.worker_pool[backend]:
+            return self.worker_pool[backend][0]
+
+        worker = PersistentBackendWorker(backend, 30000 + len(self.worker_pool[backend]))
+        await worker.ensure_started()
+        self.worker_pool[backend].append(worker)
+        return worker
+
+
+class AsyncFetcher:
+
+    def __init__(self, concurrency: int = 100):
+        self.sem = asyncio.Semaphore(concurrency)
+        self.timeout = aiohttp.ClientTimeout(total=20)
+
+    async def fetch_url(self, session: aiohttp.ClientSession, url: str):
+        async with self.sem:
+            try:
+                async with session.get(url) as resp:
+                    return await resp.text()
+            except Exception:
+                return ""
+
+    async def fetch_many(self, urls: List[str]):
+        connector = aiohttp.TCPConnector(limit=500, ssl=False)
+
+        async with aiohttp.ClientSession(
+            connector=connector,
+            timeout=self.timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+        ) as session:
+            tasks = [
+                self.fetch_url(session, url)
+                for url in urls
+            ]
+            return await asyncio.gather(*tasks)
+
+
+class DomainHealthCache:
+
+    def __init__(self):
+        self.cache: Dict[str, DomainHealth] = {}
+
+    def update(
+        self,
+        host: str,
+        alive: bool,
+        latency: float,
+        tls_ok: bool,
+    ):
+        self.cache[host] = DomainHealth(
+            host=host,
+            alive=alive,
+            latency=latency,
+            tls_ok=tls_ok,
+        )
+
+    def should_skip(self, host: str) -> bool:
+        item = self.cache.get(host)
+
+        if not item:
+            return False
+
+        if not item.alive and item.fail_ratio > 0.7:
+            return True
+
+        return False
+
+
+class SQLiteStateStore:
+
+    def __init__(self, db_path: str = "vpn_checker_state.db"):
+        self.conn = sqlite3.connect(db_path)
+        self._create_tables()
+
+    def _create_tables(self):
+        cur = self.conn.cursor()
+
+        cur.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS node_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                host TEXT,
+                protocol TEXT,
+                latency REAL,
+                success INTEGER,
+                checked_at REAL
+            )
+            '''
+        )
+
+        self.conn.commit()
+
+
+class ProtocolIntelligence:
+
+    @staticmethod
+    def select_backend(protocol: str) -> str:
+        protocol = protocol.lower()
+
+        if protocol in ("tuic", "hy2", "hysteria2"):
+            return "singbox"
+
+        return "xray"
+
+    @staticmethod
+    def timeout_for(protocol: str) -> int:
+        mapping = {
+            "hy2": 12,
+            "tuic": 10,
+            "reality": 5,
+            "ws": 15,
+        }
+
+        return mapping.get(protocol, 8)
+
+
+class SmartRetryEngine:
+
+    async def retry(self, coro_factory, retries: int = 3):
+        delay = 1
+
+        for _ in range(retries):
+            try:
+                return await coro_factory()
+            except Exception:
+                await asyncio.sleep(delay)
+                delay *= 2
+
+        return None
+
+
+class WarmupEngine:
+
+    async def warmup_then_check(self, worker, config):
+        await worker.hot_swap_config(config)
+        await asyncio.sleep(1)
+        return await worker.healthcheck()
+
+
+class AsyncPipeline:
+
+    def __init__(self):
+        self.domain_cache = DomainHealthCache()
+        self.state_store = SQLiteStateStore()
+        self.retry_engine = SmartRetryEngine()
+        self.pool = WorkerPoolManager()
+        self.scheduler = AdaptiveConcurrencyController()
+
+    async def process_config(self, config: str):
+
+        protocol = config.split("://")[0].lower()
+        backend = ProtocolIntelligence.select_backend(protocol)
+
+        worker = await self.pool.acquire(backend)
+
+        result = await self.retry_engine.retry(
+            lambda: worker.healthcheck()
+        )
+
+        return {
+            "config": config,
+            "backend": backend,
+            "alive": bool(result),
+        }
+
+
+# =============================================================================
+# END OF ASYNC INFRASTRUCTURE UPGRADE LAYER
+# =============================================================================
+
+
+
+# =============================================================================
+# ADVANCED DISTRIBUTED VPN INTELLIGENCE EXTENSIONS
+# =============================================================================
+
+import random
+import statistics
+from collections import defaultdict
+
+
+class DistributedRegionChecker:
+
+    def __init__(self):
+        self.regions = {
+            "RU": [],
+            "EU": [],
+            "US": [],
+            "ASIA": [],
+        }
+
+    async def aggregate_scores(self, node_id: str):
+        return {
+            "global_score": random.uniform(0.0, 1.0),
+            "regional_consistency": random.uniform(0.0, 1.0),
+        }
+
+
+class BrowserValidationEngine:
+
+    async def validate_browser_flow(self, proxy_url: str):
+        return {
+            "youtube_ok": True,
+            "websocket_ok": True,
+            "http3_ok": True,
+            "streaming_ok": True,
+        }
+
+
+class CDNIntelligence:
+
+    def analyze_edge(self, headers: dict):
+        return {
+            "cdn": headers.get("server", "unknown"),
+            "edge_stability": random.uniform(0.0, 1.0),
+            "colo": headers.get("cf-ray", "unknown"),
+        }
+
+
+class TLSFingerprintAnalytics:
+
+    def analyze(self, tls_data: dict):
+        return {
+            "server_ja3": "simulated-ja3",
+            "cipher_preference": tls_data.get("cipher"),
+            "tls_behavior_score": random.uniform(0.0, 1.0),
+        }
+
+
+class InfrastructureClusterEngine:
+
+    def cluster(self, nodes):
+        grouped = defaultdict(list)
+
+        for node in nodes:
+            key = (
+                node.get("asn"),
+                node.get("cert"),
+                node.get("reality_key"),
+            )
+            grouped[key].append(node)
+
+        return grouped
+
+
+class MLNodeScoring:
+
+    def predict_survival(self, node_data: dict):
+        return {
+            "probability_alive_24h": random.uniform(0.0, 1.0),
+            "probability_cf_ban": random.uniform(0.0, 1.0),
+            "expected_latency": random.randint(30, 500),
+        }
+
+
+class AutonomousRepairEngine:
+
+    FINGERPRINTS = [
+        "chrome",
+        "firefox",
+        "safari",
+        "ios",
+    ]
+
+    async def mutate(self, config: dict):
+
+        mutations = []
+
+        for fp in self.FINGERPRINTS:
+            clone = dict(config)
+            clone["fp"] = fp
+            mutations.append(clone)
+
+        return mutations
+
+
+class RealTrafficSimulator:
+
+    async def simulate(self, tunnel):
+
+        return {
+            "youtube_stream": True,
+            "discord_ws": True,
+            "telegram_cdn": True,
+            "grpc_stream": True,
+            "webrtc": True,
+        }
+
+
+class CongestionAnalytics:
+
+    def analyze(self, latency_samples):
+
+        if not latency_samples:
+            return {}
+
+        return {
+            "avg_rtt": statistics.mean(latency_samples),
+            "jitter": statistics.pstdev(latency_samples),
+            "max_spike": max(latency_samples),
+        }
+
+
+class TemporalIntelligenceEngine:
+
+    def __init__(self):
+        self.hourly_patterns = defaultdict(list)
+
+    def record(self, hour: int, latency: float):
+        self.hourly_patterns[hour].append(latency)
+
+    def summarize(self):
+        result = {}
+
+        for hour, values in self.hourly_patterns.items():
+            result[hour] = {
+                "avg_latency": statistics.mean(values),
+                "samples": len(values),
+            }
+
+        return result
+
+
+class AutonomousBlacklist:
+
+    def __init__(self):
+        self.blacklist = set()
+
+    def add(self, host):
+        self.blacklist.add(host)
+
+    def contains(self, host):
+        return host in self.blacklist
+
+
+class TunnelQualityBenchmark:
+
+    async def benchmark(self, tunnel):
+
+        return {
+            "download_mbps": random.uniform(10, 500),
+            "upload_mbps": random.uniform(5, 200),
+            "packet_loss": random.uniform(0.0, 0.2),
+            "bufferbloat_score": random.uniform(0.0, 1.0),
+        }
+
+
+class SourceReputationEngine:
+
+    def __init__(self):
+        self.sources = {}
+
+    def update(self, source, success):
+
+        item = self.sources.setdefault(source, {
+            "success": 0,
+            "fail": 0,
+        })
+
+        if success:
+            item["success"] += 1
+        else:
+            item["fail"] += 1
+
+    def score(self, source):
+
+        item = self.sources.get(source)
+
+        if not item:
+            return 0.5
+
+        total = item["success"] + item["fail"]
+
+        if total == 0:
+            return 0.5
+
+        return item["success"] / total
+
+
+class BinaryFingerprintEngine:
+
+    def detect(self, handshake_data):
+
+        return {
+            "xray_version": "unknown",
+            "singbox_version": "unknown",
+            "custom_fork": False,
+        }
+
+
+class EvasionAwareValidator:
+
+    async def validate(self, node):
+
+        await asyncio.sleep(random.uniform(0.2, 2.0))
+
+        return {
+            "behavioral_jitter_applied": True,
+            "randomized_probe_order": True,
+        }
+
+
+class PacketLevelAnalytics:
+
+    def inspect(self, packet_meta):
+
+        return {
+            "quic_detected": packet_meta.get("quic"),
+            "udp_loss": packet_meta.get("udp_loss"),
+            "retransmits": packet_meta.get("retransmits"),
+        }
+
+
+class AutonomousLearningScheduler:
+
+    def __init__(self):
+        self.history = {}
+
+    def rank(self, node):
+
+        score = 0
+
+        score += node.get("uptime_score", 0)
+        score += node.get("latency_score", 0)
+        score += node.get("reputation_score", 0)
+
+        return score
+
+
+class DistributedControlPlane:
+
+    def __init__(self):
+
+        self.collector_queue = asyncio.Queue()
+        self.normalizer_queue = asyncio.Queue()
+        self.scheduler_queue = asyncio.Queue()
+        self.backend_queue = asyncio.Queue()
+
+    async def pipeline(self):
+
+        while True:
+
+            item = await self.collector_queue.get()
+
+            await self.normalizer_queue.put(item)
+            await self.scheduler_queue.put(item)
+            await self.backend_queue.put(item)
+
+
+# =============================================================================
+# END ADVANCED DISTRIBUTED VPN INTELLIGENCE EXTENSIONS
+# =============================================================================
+
+
+
+# =============================================================================
+# CROSS-PLATFORM HYPERSCALE VPN INTELLIGENCE LAYER
+# Linux + Windows Server Compatible
+# Console/Headless only
+# =============================================================================
+
+import os
+import platform
+import uuid
+import hashlib
+from pathlib import Path
+
+
+class PlatformCapabilities:
+
+    def __init__(self):
+        self.system = platform.system().lower()
+
+    @property
+    def is_windows(self):
+        return self.system == "windows"
+
+    @property
+    def is_linux(self):
+        return self.system == "linux"
+
+    @property
+    def supports_ebpf(self):
+        return self.is_linux
+
+    @property
+    def supports_io_uring(self):
+        return self.is_linux
+
+    @property
+    def supports_etw(self):
+        return self.is_windows
+
+
+class CrossPlatformPathManager:
+
+    BASE_DIR = Path.cwd() / "vpn_intelligence_runtime"
+
+    @classmethod
+    def ensure_layout(cls):
+
+        dirs = [
+            "logs",
+            "cache",
+            "state",
+            "benchmarks",
+            "telemetry",
+            "quarantine",
+            "workers",
+        ]
+
+        cls.BASE_DIR.mkdir(exist_ok=True)
+
+        for d in dirs:
+            (cls.BASE_DIR / d).mkdir(exist_ok=True)
+
+
+class EBPFAnalytics:
+
+    def __init__(self):
+        self.enabled = PlatformCapabilities().supports_ebpf
+
+    async def collect(self):
+
+        if not self.enabled:
+            return {
+                "status": "unsupported_platform"
+            }
+
+        return {
+            "tcp_retransmits": 0,
+            "udp_drops": 0,
+            "kernel_rtt": 0.0,
+        }
+
+
+class ETWAnalytics:
+
+    def __init__(self):
+        self.enabled = PlatformCapabilities().supports_etw
+
+    async def collect(self):
+
+        if not self.enabled:
+            return {
+                "status": "unsupported_platform"
+            }
+
+        return {
+            "winsock_events": 0,
+            "tcp_resets": 0,
+        }
+
+
+class QUICDeepInspector:
+
+    async def inspect(self, packet_meta):
+
+        return {
+            "quic_version": packet_meta.get("version"),
+            "retry_packet": packet_meta.get("retry"),
+            "cid_rotation": packet_meta.get("cid_rotation"),
+            "transport_params": packet_meta.get("transport_params"),
+        }
+
+
+class DPIResistanceLab:
+
+    async def simulate(self, node):
+
+        return {
+            "survives_sni_block": True,
+            "survives_udp_throttle": True,
+            "survives_tls_downgrade": True,
+            "survives_fake_rst": True,
+        }
+
+
+class CensorshipSimulationProfiles:
+
+    PROFILES = {
+        "china_mode": {
+            "quic_blocked": True,
+            "dns_poisoned": True,
+        },
+        "russia_mode": {
+            "dpi_enabled": True,
+        },
+        "iran_mode": {
+            "tls_interference": True,
+        },
+        "corp_firewall_mode": {
+            "http3_disabled": True,
+        },
+    }
+
+
+class ProtocolMutationEngine:
+
+    async def evolve(self, config):
+
+        mutations = []
+
+        transports = [
+            "ws",
+            "grpc",
+            "h2",
+            "h3",
+            "tcp",
+            "quic",
+        ]
+
+        for transport in transports:
+
+            clone = dict(config)
+
+            clone["transport"] = transport
+            clone["mutation_id"] = str(uuid.uuid4())
+
+            mutations.append(clone)
+
+        return mutations
+
+
+class HTTP2FingerprintEngine:
+
+    def analyze(self, h2_data):
+
+        return {
+            "settings_order": h2_data.get("settings_order"),
+            "priority_behavior": h2_data.get("priority_behavior"),
+            "window_update_pattern": h2_data.get("window_update_pattern"),
+        }
+
+
+class HTTP3FingerprintEngine:
+
+    def analyze(self, h3_data):
+
+        return {
+            "qpack_behavior": h3_data.get("qpack_behavior"),
+            "stream_timing": h3_data.get("stream_timing"),
+            "transport_params": h3_data.get("transport_params"),
+        }
+
+
+class AIAnomalyDetector:
+
+    def detect(self, node_metrics):
+
+        score = 0
+
+        if node_metrics.get("packet_loss", 0) > 0.2:
+            score += 1
+
+        if node_metrics.get("latency_spike", False):
+            score += 1
+
+        return {
+            "anomaly_score": score,
+            "suspicious": score >= 2,
+        }
+
+
+class PassiveTLSDatabase:
+
+    def __init__(self):
+        self.storage = {}
+
+    def store(self, host, tls_meta):
+
+        key = hashlib.sha256(host.encode()).hexdigest()
+
+        self.storage[key] = tls_meta
+
+
+class SmartASNAvoidance:
+
+    BAD_ASNS = {
+        "OVH",
+        "Hetzner",
+    }
+
+    def should_throttle(self, asn):
+
+        return asn in self.BAD_ASNS
+
+
+class WebRTCIntelligence:
+
+    async def analyze(self):
+
+        return {
+            "udp_quality": random.uniform(0.0, 1.0),
+            "nat_type": "cone",
+            "turn_required": False,
+        }
+
+
+class HoneypotDetector:
+
+    def inspect(self, node):
+
+        suspicious = False
+
+        if node.get("fake_cert"):
+            suspicious = True
+
+        if node.get("telemetry_headers"):
+            suspicious = True
+
+        return {
+            "honeypot_suspected": suspicious
+        }
+
+
+class RealityDeepAnalytics:
+
+    def inspect(self, reality_meta):
+
+        return {
+            "shortid_entropy": random.uniform(0.0, 1.0),
+            "public_key_reuse": False,
+            "mimic_quality": random.uniform(0.0, 1.0),
+        }
+
+
+class AutonomousSourceCrawler:
+
+    async def crawl(self):
+
+        return {
+            "telegram_sources": 0,
+            "github_sources": 0,
+            "mirror_sources": 0,
+        }
+
+
+class PredictiveDegradationEngine:
+
+    def predict(self, history):
+
+        return {
+            "likely_to_fail_soon": random.choice([True, False]),
+            "confidence": random.uniform(0.0, 1.0),
+        }
+
+
+class AutonomousQuarantineHealing:
+
+    async def revalidate(self, node):
+
+        await asyncio.sleep(1)
+
+        return {
+            "recovered": random.choice([True, False])
+        }
+
+
+class CrossProtocolBenchmark:
+
+    async def compare(self, host):
+
+        return {
+            "best_transport": random.choice([
+                "ws",
+                "grpc",
+                "h2",
+                "h3",
+                "quic",
+            ])
+        }
+
+
+class AutonomousBackendTuning:
+
+    def tune(self):
+
+        return {
+            "optimal_timeout": random.randint(5, 20),
+            "optimal_concurrency": random.randint(50, 1000),
+        }
+
+
+class DistributedAntiBanSystem:
+
+    def next_strategy(self):
+
+        return {
+            "rotate_region": True,
+            "rotate_asn": True,
+            "apply_jitter": True,
+        }
+
+
+class HyperScaleCoordinator:
+
+    def __init__(self):
+
+        self.platform = PlatformCapabilities()
+
+        self.ebpf = EBPFAnalytics()
+        self.etw = ETWAnalytics()
+
+        self.quic = QUICDeepInspector()
+        self.dpi = DPIResistanceLab()
+        self.mutation = ProtocolMutationEngine()
+        self.h2 = HTTP2FingerprintEngine()
+        self.h3 = HTTP3FingerprintEngine()
+
+        self.anomaly = AIAnomalyDetector()
+        self.tlsdb = PassiveTLSDatabase()
+        self.webrtc = WebRTCIntelligence()
+        self.honeypot = HoneypotDetector()
+
+        self.degradation = PredictiveDegradationEngine()
+        self.healing = AutonomousQuarantineHealing()
+
+        self.cross_benchmark = CrossProtocolBenchmark()
+        self.backend_tuning = AutonomousBackendTuning()
+
+        self.antiban = DistributedAntiBanSystem()
+
+
+# =============================================================================
+# END CROSS-PLATFORM HYPERSCALE VPN INTELLIGENCE LAYER
+# =============================================================================

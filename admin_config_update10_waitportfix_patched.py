@@ -54,6 +54,7 @@ Examples:
   python admin_config_update.py update --mode 1          # use whatever is on disk
   python admin_config_update.py update --sources kort0881,v2ray_agg,epodonios
   python admin_config_update.py update --sources epodonios
+  python admin_config_update.py update --sources keysconf,vlesskey,outlinekeys
   python admin_config_update.py fetch --mode 2 --output raw.txt
   python admin_config_update.py check --input my_configs.txt
   python admin_config_update.py upload --input verified_configs.txt
@@ -424,6 +425,13 @@ URLS_BASE: list[str] = [
     "https://raw.githubusercontent.com/Hossein-nrj/awesome-freedom/master/configs.txt",
     "https://raw.githubusercontent.com/wrfree/free/main/v2",
     "https://raw.githubusercontent.com/polimi6/polimi6.github.io/main/v2ray_config.txt",
+
+    # ── Requested additional elite sources ───────────────────────────────────
+    "https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/vless.txt",
+    "https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/mixed.txt",
+    "https://raw.githubusercontent.com/hiztin/VLESS-PO-GRIBI/main/subscription.txt",
+    "https://raw.githubusercontent.com/kudryash0vv/kudryash0vv.YKTFLOW/main/vless.txt",
+    "https://raw.githubusercontent.com/kudryash0vv/kudryash0vv.YKTFLOW/main/mixed.txt",
 ]
 
 # ── Telegram-каналы с VPN-конфигами ──────────────────────────────────────────
@@ -452,6 +460,7 @@ TG_CHANNELS: list[str] = [
     "MrMohebi_xray",
     "v2raytunkeys",
     "KeysConf",
+    "vlesskeys",
 ]
 
 # Максимум страниц t.me/s/<channel>?before=<id> для парсинга (каждая ~20 сообщений)
@@ -610,13 +619,16 @@ def _run_update_script(repo_dir: Path, script_candidates: list[str],
 
 
 # Maximum age (days) of a config file's last git commit.
-# Files not updated within this window are skipped — stale configs
+# Files whose LAST GIT COMMIT is older than this window are skipped — stale configs
 # are unlikely to still be alive.
 MAX_FILE_AGE_DAYS = 45
 
 
 def _git_file_mtime(repo_dir: Path, filepath: Path) -> Optional[float]:
     """Return the Unix timestamp of the last git commit that touched `filepath`.
+
+    IMPORTANT:
+    Uses git commit time, NOT filesystem/download time.
 
     Uses `git log -1 --format=%ct` which is fast (single-file log).
     Returns None if git is unavailable or the file has no commit history.
@@ -675,11 +687,20 @@ def _collect_all_txt_links(repo_dir: Path, label: str = "", only_updated: bool =
     for fp in txt_files:
         rel = fp.relative_to(repo_dir)
 
-        # Mode 4: пропускаем файлы, не изменённые после запуска скрипта
+        # Mode 4:
+        # Проверяем дату последнего git-коммита файла,
+        # а НЕ filesystem mtime после clone/download.
+        #
+        # Иначе git clone делает все файлы "новыми",
+        # даже если сами конфиги старые.
         if only_updated:
-            fs_mtime = fp.stat().st_mtime
-            if fs_mtime < SCRIPT_START_TIME:
-                print(f"  ⏭  {rel} — skipped (not updated since script start)")
+            git_mtime = _git_file_mtime(repo_dir, fp)
+
+            # fallback если git history недоступна
+            effective_mtime = git_mtime or fp.stat().st_mtime
+
+            if effective_mtime < SCRIPT_START_TIME:
+                print(f"  ⏭  {rel} — skipped (git commit older than script start)")
                 continue
 
         # Age check
@@ -1010,21 +1031,28 @@ def _fetch_source_urls_base(work_dir: Path) -> list[str]:
 # ── Keysconf.com parser ───────────────────────────────────────────────────────
 
 KEYSCONF_BASE = "https://keysconf.com"
+VLESSKEY_BASE = "https://vlesskey.com"
+OUTLINEKEYS_BASE = "https://outlinekeys.com"
 KEYSCONF_CONCURRENT = 40   # параллельных запросов к сайту
 
 
-def _fetch_source_keysconf(work_dir: Path) -> list[str]:
-    """Parse keysconf.com: собирает конфиги со всех страниц пагинации.
+def _fetch_source_keysite(work_dir: Path, site_name: str, base_url: str) -> list[str]:
+    """Generic parser for keysconf-style sites.
 
-    Алгоритм:
-      1. Скачиваем страницы /?page=1..N параллельно (40 потоков).
-      2. Из каждой страницы извлекаем ссылки на карточки конфигов.
-      3. Фильтруем по статусу Online (badge bg-success).
-      4. Параллельно заходим на каждую страницу конфига и берём <code>.
-      5. Сохраняем в sources/keysconf/all.txt.
+    Supports:
+      - keysconf.com
+      - vlesskey.com
+      - outlinekeys.com
+
+    Features:
+      - walks all pagination pages automatically
+      - collects ONLY Online configs
+      - preserves country info from card/listing page in output comments
+      - saves results into sources/<site_name>/all.txt
     """
     import html as _html
-    out_dir = work_dir / "keysconf"
+
+    out_dir = work_dir / site_name
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / "all.txt"
 
@@ -1035,7 +1063,7 @@ def _fetch_source_keysconf(work_dir: Path) -> list[str]:
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
     }
 
-    def _http_get(url: str, timeout: int = 15) -> Optional[str]:
+    def _http_get(url: str, timeout: int = 20) -> Optional[str]:
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -1043,96 +1071,156 @@ def _fetch_source_keysconf(work_dir: Path) -> list[str]:
         except Exception:
             return None
 
-    # ── Шаг 1: определяем количество страниц ─────────────────────────────────
-    print(f"  🌐  keysconf: fetching page count ...", flush=True)
-    first_html = _http_get(f"{KEYSCONF_BASE}/?page=1")
+    print(f"  🌐  {site_name}: fetching page count ...", flush=True)
+    first_html = _http_get(f"{base_url}/?page=1")
     if not first_html:
-        print("  ⚠  keysconf: cannot reach keysconf.com")
+        print(f"  ⚠  {site_name}: cannot reach {base_url}")
         return []
 
-    # Ищем максимальный номер страницы в пагинации
-    page_nums = [int(m) for m in re.findall(r'href="[/?].*?page=(\d+)"', first_html)]
+    page_nums = [int(m) for m in re.findall(r'[?&]page=(\d+)', first_html)]
     max_page = max(page_nums) if page_nums else 1
-    print(f"  📄  keysconf: {max_page} pages detected", flush=True)
+    print(f"  📄  {site_name}: {max_page} pages detected", flush=True)
 
-    # ── Шаг 2: параллельно скачиваем все страницы листинга ───────────────────
-    def _parse_listing_page(page_num: int) -> list[str]:
-        """Возвращает список относительных URL карточек (только Online)."""
-        html = _http_get(f"{KEYSCONF_BASE}/?page={page_num}")
+    def _parse_listing_page(page_num: int) -> list[tuple[str, str]]:
+        html = _http_get(f"{base_url}/?page={page_num}")
         if not html:
             return []
-        # Ищем карточки: href="/vless/NNN/" или "/vmess/NNN/" и т.д.
-        # Берём только те, где рядом есть badge bg-success (Online)
-        # Простая эвристика: ищем все <div class="card mb-3"...> блоки
-        card_pattern = re.compile(
-            r'<div[^>]+class="card mb-3"[^>]*data-protocol="([^"]+)"[^>]*>.*?'
-            r'<a\s+href="(/(?:vless|vmess|trojan|ss|hy2|tuic)/\d+/)"[^>]*>.*?'
-            r'(Online)',
+
+        cards: list[tuple[str, str]] = []
+
+        card_blocks = re.findall(
+            r'(<div[^>]+class="card mb-3".*?</div>\s*</div>)',
+            html,
             re.DOTALL | re.IGNORECASE,
         )
-        links = []
-        for m in card_pattern.finditer(html):
-            links.append(m.group(2))  # относительный URL
-        # Фолбек: просто берём все ссылки на конфиги (если Online-фильтр не нашёл)
-        if not links:
-            for href in re.findall(r'href="(/(?:vless|vmess|trojan|ss|hy2|tuic)/\d+/)"', html):
-                links.append(href)
-        return list(dict.fromkeys(links))
 
-    all_card_urls: list[str] = []
+        for block in card_blocks:
+            if "Online" not in block:
+                continue
+
+            href_match = re.search(
+                r'href="(/(?:vless|vmess|trojan|ss|hy2|tuic|outline)/\d+/)"',
+                block,
+                re.IGNORECASE,
+            )
+            if not href_match:
+                continue
+
+            country = ""
+            country_match = re.search(
+                r'(?:country|flag)[^>]*>\s*([^<]{2,40})\s*<',
+                block,
+                re.IGNORECASE,
+            )
+            if country_match:
+                country = country_match.group(1).strip()
+
+            cards.append((href_match.group(1), country))
+
+        if not cards:
+            fallback_links = re.findall(
+                r'href="(/(?:vless|vmess|trojan|ss|hy2|tuic|outline)/\d+/)"',
+                html,
+                re.IGNORECASE,
+            )
+            cards = [(x, "") for x in fallback_links]
+
+        return list(dict.fromkeys(cards))
+
+    all_card_urls: list[tuple[str, str]] = []
+
     with ThreadPoolExecutor(max_workers=KEYSCONF_CONCURRENT) as ex:
-        futures = {ex.submit(_parse_listing_page, p): p for p in range(1, max_page + 1)}
+        futures = {
+            ex.submit(_parse_listing_page, p): p
+            for p in range(1, max_page + 1)
+        }
+
         for f in as_completed(futures):
-            result = f.result()
-            all_card_urls.extend(result)
+            all_card_urls.extend(f.result())
 
     all_card_urls = list(dict.fromkeys(all_card_urls))
-    print(f"  📋  keysconf: {len(all_card_urls)} config pages found", flush=True)
+
+    print(f"  📋  {site_name}: {len(all_card_urls)} config pages found", flush=True)
 
     if not all_card_urls:
-        print("  ⚠  keysconf: no config links found on listing pages")
+        print(f"  ⚠  {site_name}: no config links found")
         return []
 
-    # ── Шаг 3: параллельно заходим на каждую страницу конфига ────────────────
     found_configs: list[str] = []
-    done_count   = [0]
-    lock         = threading.Lock()
+    done_count = [0]
+    lock = threading.Lock()
 
-    def _parse_config_page(rel_url: str) -> Optional[str]:
-        html = _http_get(f"{KEYSCONF_BASE}{rel_url}")
+    def _parse_config_page(item: tuple[str, str]) -> Optional[str]:
+        rel_url, country = item
+
+        html = _http_get(f"{base_url}{rel_url}")
         if not html:
             return None
-        # Конфиг лежит в <code> внутри .connection-card
-        # data-copy="vless://..." — самый надёжный способ
+
+        cfg = None
+
         m = re.search(r'data-copy="([^"]+://[^"]+)"', html)
         if m:
-            return _html.unescape(m.group(1)).strip()
-        # Фолбек: первый <code> с ://
-        m = re.search(r'<code[^>]*>\s*([a-z0-9]+://[^\s<]+)\s*</code>', html, re.IGNORECASE)
-        if m:
-            return _html.unescape(m.group(1)).strip()
-        return None
+            cfg = _html.unescape(m.group(1)).strip()
+
+        if not cfg:
+            m = re.search(
+                r'<code[^>]*>\s*([a-z0-9]+://[^\s<]+)\s*</code>',
+                html,
+                re.IGNORECASE,
+            )
+            if m:
+                cfg = _html.unescape(m.group(1)).strip()
+
+        if cfg and country and "#" not in cfg:
+            cfg = f"{cfg}#{urllib.parse.quote(country)}"
+
+        return cfg
 
     with ThreadPoolExecutor(max_workers=KEYSCONF_CONCURRENT) as ex:
-        futures = {ex.submit(_parse_config_page, u): u for u in all_card_urls}
+        futures = {
+            ex.submit(_parse_config_page, item): item
+            for item in all_card_urls
+        }
+
         for f in as_completed(futures):
             cfg = f.result()
+
             with lock:
                 done_count[0] += 1
-                if cfg and _is_valid_link(cfg):
+
+                if cfg and _is_valid_link(cfg.split("#")[0]):
                     found_configs.append(cfg)
+
                 if done_count[0] % 50 == 0:
-                    print(f"    keysconf {done_count[0]}/{len(all_card_urls)} "
-                          f" found: {len(found_configs)}", end="\r", flush=True)
+                    print(
+                        f"    {site_name} {done_count[0]}/{len(all_card_urls)} "
+                        f"found: {len(found_configs)}",
+                        end="\r",
+                        flush=True,
+                    )
 
     found_configs = list(dict.fromkeys(found_configs))
-    print(f"\n  ✓  keysconf: {len(found_configs)} valid configs", flush=True)
 
-    # Сохраняем
+    print(f"\n  ✓  {site_name}: {len(found_configs)} valid configs", flush=True)
+
     out_file.write_text("\n".join(found_configs), encoding="utf-8")
-    print(f"  💾  keysconf: saved → {out_file}", flush=True)
+
+    print(f"  💾  {site_name}: saved → {out_file}", flush=True)
 
     return found_configs
+
+
+def _fetch_source_keysconf(work_dir: Path) -> list[str]:
+    return _fetch_source_keysite(work_dir, "keysconf", KEYSCONF_BASE)
+
+
+def _fetch_source_vlesskey(work_dir: Path) -> list[str]:
+    return _fetch_source_keysite(work_dir, "vlesskey", VLESSKEY_BASE)
+
+
+def _fetch_source_outlinekeys(work_dir: Path) -> list[str]:
+    return _fetch_source_keysite(work_dir, "outlinekeys", OUTLINEKEYS_BASE)
 
 
 def _fetch_source_local_dir(local_path: Path) -> list[str]:
@@ -1385,6 +1473,10 @@ def fetch_all_sources(
             links = _fetch_source_urls_base(work_dir)
         elif src in ("keysconf", "keysconf.com"):
             links = _fetch_source_keysconf(work_dir)
+        elif src in ("vlesskey", "vlesskey.com"):
+            links = _fetch_source_vlesskey(work_dir)
+        elif src in ("outlinekeys", "outlinekeys.com"):
+            links = _fetch_source_outlinekeys(work_dir)
         elif src in ("telegram", "tg") or src.startswith("telegram:") or src.startswith("tg:"):
             # telegram              — парсит все каналы из TG_CHANNELS
             # telegram:chan1,chan2  — парсит конкретные каналы
@@ -1442,7 +1534,9 @@ def _fetch_direct_url(url: str) -> list[str]:
 MAX_PING_MS   = 1000   # до 1000 мс — отсекаем совсем мёртвые хосты
 PING_TIMEOUT  = 3.0    # 3 сек на коннект
 PING_WORKERS  = 100
-CHECK_WORKERS = 24     # 24 воркера = 24 xray-процесса одновременно (стабильно на Windows)
+CHECK_WORKERS = 20 if sys.platform == "win32" else 32
+XRAY_START_TIMEOUT = 12.0
+XRAY_READY_CHECK_INTERVAL = 0.05
 
 # 3-stage xray check
 # MIN_MS убран везде — скорость не критерий, важна только корректность данных.
@@ -2442,6 +2536,53 @@ def _start_xray(link: str, xray_exe: str, port: int, zapret_port: Optional[int] 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
             json.dump(cfg, f)
             tmp = f.name
+
+        flags = 0
+        if sys.platform == "win32":
+            flags = subprocess.CREATE_NO_WINDOW
+
+        proc = subprocess.Popen(
+            [xray_exe, "run", "-c", tmp],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=flags,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        deadline = time.monotonic() + XRAY_START_TIMEOUT
+        startup_log = []
+
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                try:
+                    startup_log.append(proc.stdout.read())
+                except Exception:
+                    pass
+                log_text = "".join(startup_log).strip()
+                if log_text:
+                    print(f"  ⚠  xray exited during startup on port {port}:\\n{log_text[:1500]}")
+                return None, tmp
+
+            if _wait_port(port, 0.5):
+                return proc, tmp
+
+            time.sleep(XRAY_READY_CHECK_INTERVAL)
+
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+        return None, tmp
+    except Exception:
+        return None, None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(cfg, f)
+            tmp = f.name
         flags = 0x08000000 if sys.platform == "win32" else 0
         proc = subprocess.Popen(
             [xray_exe, "run", "-c", tmp],
@@ -2465,14 +2606,20 @@ def _kill_xray(proc, tmp):
             pass
 
 
-def _wait_port(port: int, timeout: float = 5.0) -> bool:
+def _wait_port(port: int, timeout: float = XRAY_START_TIMEOUT) -> bool:
+    """Wait until SOCKS5 listener is actually ready, not just bound."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                return True
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5) as s:
+                s.settimeout(0.5)
+                s.sendall(b"\x05\x01\x00")
+                resp = s.recv(2)
+                if resp and resp[0] == 0x05:
+                    return True
         except OSError:
-            time.sleep(0.05)
+            pass
+        time.sleep(XRAY_READY_CHECK_INTERVAL)
     return False
 
 
@@ -3415,7 +3562,16 @@ def _interactive_menu() -> "argparse.Namespace":
             ("keysconf",  "keysconf   — keysconf.com (твой сайт, Online конфиги)",   True,  False),
             ("urls_base", "urls_base  — 60+ GitHub raw-URL источников",              True,  False),
             ("telegram",  "telegram   — 17 TG-каналов с конфигами (без API key)",    False, True),
-        ]
+        
+    "https://github.com/soroushmirzaei/telegram-configs-collector",
+    "https://github.com/barry-far/V2ray-Configs",
+    "https://github.com/mahdibland/V2RayAggregator",
+    "https://github.com/ermaozi/get_subscribe",
+    "https://github.com/aiboboxx/v2rayfree",
+    "https://github.com/Pawdroid/Free-servers",
+    "https://github.com/ALIILAPRO/v2rayNG-Config",
+    "https://github.com/mfuu/v2ray",
+]
         selected = {k: default for k, _, default, _ in ALL_SOURCES}
 
         print("\n" + "-"*60)

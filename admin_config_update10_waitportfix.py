@@ -424,6 +424,13 @@ URLS_BASE: list[str] = [
     "https://raw.githubusercontent.com/Hossein-nrj/awesome-freedom/master/configs.txt",
     "https://raw.githubusercontent.com/wrfree/free/main/v2",
     "https://raw.githubusercontent.com/polimi6/polimi6.github.io/main/v2ray_config.txt",
+
+    # ── Requested additional elite sources ───────────────────────────────────
+    "https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/vless.txt",
+    "https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/mixed.txt",
+    "https://raw.githubusercontent.com/hiztin/VLESS-PO-GRIBI/main/subscription.txt",
+    "https://raw.githubusercontent.com/kudryash0vv/kudryash0vv.YKTFLOW/main/vless.txt",
+    "https://raw.githubusercontent.com/kudryash0vv/kudryash0vv.YKTFLOW/main/mixed.txt",
 ]
 
 # ── Telegram-каналы с VPN-конфигами ──────────────────────────────────────────
@@ -452,6 +459,7 @@ TG_CHANNELS: list[str] = [
     "MrMohebi_xray",
     "v2raytunkeys",
     "KeysConf",
+    "vlesskeys",
 ]
 
 # Максимум страниц t.me/s/<channel>?before=<id> для парсинга (каждая ~20 сообщений)
@@ -610,13 +618,16 @@ def _run_update_script(repo_dir: Path, script_candidates: list[str],
 
 
 # Maximum age (days) of a config file's last git commit.
-# Files not updated within this window are skipped — stale configs
+# Files whose LAST GIT COMMIT is older than this window are skipped — stale configs
 # are unlikely to still be alive.
 MAX_FILE_AGE_DAYS = 45
 
 
 def _git_file_mtime(repo_dir: Path, filepath: Path) -> Optional[float]:
     """Return the Unix timestamp of the last git commit that touched `filepath`.
+
+    IMPORTANT:
+    Uses git commit time, NOT filesystem/download time.
 
     Uses `git log -1 --format=%ct` which is fast (single-file log).
     Returns None if git is unavailable or the file has no commit history.
@@ -675,11 +686,20 @@ def _collect_all_txt_links(repo_dir: Path, label: str = "", only_updated: bool =
     for fp in txt_files:
         rel = fp.relative_to(repo_dir)
 
-        # Mode 4: пропускаем файлы, не изменённые после запуска скрипта
+        # Mode 4:
+        # Проверяем дату последнего git-коммита файла,
+        # а НЕ filesystem mtime после clone/download.
+        #
+        # Иначе git clone делает все файлы "новыми",
+        # даже если сами конфиги старые.
         if only_updated:
-            fs_mtime = fp.stat().st_mtime
-            if fs_mtime < SCRIPT_START_TIME:
-                print(f"  ⏭  {rel} — skipped (not updated since script start)")
+            git_mtime = _git_file_mtime(repo_dir, fp)
+
+            # fallback если git history недоступна
+            effective_mtime = git_mtime or fp.stat().st_mtime
+
+            if effective_mtime < SCRIPT_START_TIME:
+                print(f"  ⏭  {rel} — skipped (git commit older than script start)")
                 continue
 
         # Age check
@@ -1442,7 +1462,9 @@ def _fetch_direct_url(url: str) -> list[str]:
 MAX_PING_MS   = 1000   # до 1000 мс — отсекаем совсем мёртвые хосты
 PING_TIMEOUT  = 3.0    # 3 сек на коннект
 PING_WORKERS  = 100
-CHECK_WORKERS = 24     # 24 воркера = 24 xray-процесса одновременно (стабильно на Windows)
+CHECK_WORKERS = 20 if sys.platform == "win32" else 32
+XRAY_START_TIMEOUT = 12.0
+XRAY_READY_CHECK_INTERVAL = 0.05
 
 # 3-stage xray check
 # MIN_MS убран везде — скорость не критерий, важна только корректность данных.
@@ -2442,6 +2464,53 @@ def _start_xray(link: str, xray_exe: str, port: int, zapret_port: Optional[int] 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
             json.dump(cfg, f)
             tmp = f.name
+
+        flags = 0
+        if sys.platform == "win32":
+            flags = subprocess.CREATE_NO_WINDOW
+
+        proc = subprocess.Popen(
+            [xray_exe, "run", "-c", tmp],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=flags,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        deadline = time.monotonic() + XRAY_START_TIMEOUT
+        startup_log = []
+
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                try:
+                    startup_log.append(proc.stdout.read())
+                except Exception:
+                    pass
+                log_text = "".join(startup_log).strip()
+                if log_text:
+                    print(f"  ⚠  xray exited during startup on port {port}:\\n{log_text[:1500]}")
+                return None, tmp
+
+            if _wait_port(port, 0.5):
+                return proc, tmp
+
+            time.sleep(XRAY_READY_CHECK_INTERVAL)
+
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+        return None, tmp
+    except Exception:
+        return None, None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump(cfg, f)
+            tmp = f.name
         flags = 0x08000000 if sys.platform == "win32" else 0
         proc = subprocess.Popen(
             [xray_exe, "run", "-c", tmp],
@@ -2465,14 +2534,20 @@ def _kill_xray(proc, tmp):
             pass
 
 
-def _wait_port(port: int, timeout: float = 5.0) -> bool:
+def _wait_port(port: int, timeout: float = XRAY_START_TIMEOUT) -> bool:
+    """Wait until SOCKS5 listener is actually ready, not just bound."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                return True
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5) as s:
+                s.settimeout(0.5)
+                s.sendall(b"\x05\x01\x00")
+                resp = s.recv(2)
+                if resp and resp[0] == 0x05:
+                    return True
         except OSError:
-            time.sleep(0.05)
+            pass
+        time.sleep(XRAY_READY_CHECK_INTERVAL)
     return False
 
 
@@ -3415,7 +3490,16 @@ def _interactive_menu() -> "argparse.Namespace":
             ("keysconf",  "keysconf   — keysconf.com (твой сайт, Online конфиги)",   True,  False),
             ("urls_base", "urls_base  — 60+ GitHub raw-URL источников",              True,  False),
             ("telegram",  "telegram   — 17 TG-каналов с конфигами (без API key)",    False, True),
-        ]
+        
+    "https://github.com/soroushmirzaei/telegram-configs-collector",
+    "https://github.com/barry-far/V2ray-Configs",
+    "https://github.com/mahdibland/V2RayAggregator",
+    "https://github.com/ermaozi/get_subscribe",
+    "https://github.com/aiboboxx/v2rayfree",
+    "https://github.com/Pawdroid/Free-servers",
+    "https://github.com/ALIILAPRO/v2rayNG-Config",
+    "https://github.com/mfuu/v2ray",
+]
         selected = {k: default for k, _, default, _ in ALL_SOURCES}
 
         print("\n" + "-"*60)
