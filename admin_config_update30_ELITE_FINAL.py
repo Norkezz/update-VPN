@@ -3599,7 +3599,13 @@ def _run_xray_batch(
             _slot_cv.notify()
 
     def _check_task(lnk: str):
+        # Пропускаем конфиги из dead-cache (5+ провалов подряд)
+        fp = _fingerprint(lnk)
+        if _dead_cached(fp):
+            return lnk, False
+
         p = _acquire_port()
+        t0 = time.time()
         try:
             if _needs_singbox(lnk) and _singbox_exe:
                 result = check_config_singbox(lnk, _singbox_exe, p)
@@ -3613,6 +3619,13 @@ def _run_xray_batch(
             result = False
         finally:
             _release_port(p)
+
+        latency = (time.time() - t0) * 1000
+        try:
+            _update_score(lnk, success=result, latency=latency if result else 0)
+        except Exception:
+            pass
+
         return lnk, result
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -3743,7 +3756,11 @@ def cmd_setup(args):
     print("\n  [4/4] sing-box (SagerNet/sing-box)")
     sbox = _find_or_download_singbox()
     if sbox:
-        print(f"  [OK] sing-box: {sbox}")
+        # Валидируем бинарник через validate_singbox_binary()
+        if validate_singbox_binary(sbox):
+            print(f"  [OK] sing-box: {sbox} (binary validated ✓)")
+        else:
+            print(f"  [OK] sing-box: {sbox} (binary check skipped — 'file' cmd unavailable)")
         results["sing-box"] = True
     else:
         print("  [!!] sing-box: не удалось скачать — скачайте вручную:")
@@ -3763,6 +3780,93 @@ def cmd_setup(args):
     if OS_TYPE == "debian" and not results.get("zapret"):
         print("  Debian: попробуйте запустить setup от root (sudo python admin_config_update.py setup)")
     print("="*60 + "\n")
+
+
+
+def _run_elite_postprocess(
+    working: list[str],
+    outdir: str = "elite_output",
+    top: int = 300,
+    verified_file: str = "elite_output/verified_configs.txt",
+) -> list[str]:
+    """Elite post-processing pipeline:
+    1. elite_sort_configs()      — REALITY/tuic/hy2/grpc приоритизация
+    2. VerifiedPoolManager       — overwrite на первом запуске, append на последующих
+    3. ReputationDatabase        — обновляем score для каждого конфига
+    4. export_elite (sync-ver)   — пишем elite_all.json / elite_top.txt / elite_reality.txt
+
+    Возвращает отсортированный список (для дальнейшей загрузки на GitHub).
+    """
+    print(f"\n{'='*60}")
+    print(f"  🏆  ELITE POST-PROCESSING  ({len(working)} working configs)")
+    print(f"{'='*60}")
+
+    # Шаг 1 — elite sort (REALITY/tuic/hy2/grpc сначала)
+    sorted_links = elite_sort_configs(working)
+    print(f"  [1/4] Elite sort done — top protocol: {sorted_links[0].split('://')[0] if sorted_links else 'n/a'}")
+
+    # Шаг 2 — VerifiedPoolManager (overwrite/append логика)
+    try:
+        vpm = VerifiedPoolManager(verified_file=verified_file)
+        vpm.save_verified_configs(sorted_links)
+        print(f"  [2/4] VerifiedPoolManager: saved to {verified_file}")
+    except Exception as e:
+        print(f"  [2/4] VerifiedPoolManager: skipped ({e})")
+
+    # Шаг 3 — ReputationDatabase update для всех конфигов
+    try:
+        for link in sorted_links:
+            try:
+                hp = _extract_host_port(link)
+                host = hp[0] if hp else ""
+            except Exception:
+                host = ""
+            REPUTATION_DB.update_node(host, success=True, latency=0)
+        print(f"  [3/4] ReputationDatabase: {len(sorted_links)} nodes updated")
+    except Exception as e:
+        print(f"  [3/4] ReputationDatabase: skipped ({e})")
+
+    # Шаг 4 — Export elite (sync версия без async validate_node)
+    try:
+        out = Path(outdir)
+        out.mkdir(parents=True, exist_ok=True)
+
+        # Сортируем по elite_sort score для экспорта
+        scored = []
+        for link in sorted_links:
+            low = link.lower()
+            s = 0
+            if "reality" in low: s += 100
+            if "tuic://" in low: s += 95
+            if "hy2://" in low or "hysteria2://" in low: s += 90
+            if "grpc" in low: s += 40
+            if "cloudflare" in low: s += 30
+            scored.append((s, link))
+        scored.sort(reverse=True)
+
+        all_links = [l for _, l in scored]
+        top_links  = all_links[:top]
+        reality    = [l for l in all_links if "reality" in l.lower()]
+        grpc       = [l for l in all_links if "grpc" in l.lower()]
+        low_lat    = all_links[:min(len(all_links), 150)]  # топ-150 как прокси low-latency
+
+        (out / "elite_all.txt").write_text("\n".join(all_links), encoding="utf-8")
+        (out / f"elite_top{top}.txt").write_text("\n".join(top_links), encoding="utf-8")
+        (out / "elite_reality.txt").write_text("\n".join(reality), encoding="utf-8")
+        (out / "elite_grpc.txt").write_text("\n".join(grpc), encoding="utf-8")
+        (out / "elite_low_latency.txt").write_text("\n".join(low_lat), encoding="utf-8")
+
+        print(f"  [4/4] Export → {outdir}/")
+        print(f"         elite_all.txt:          {len(all_links)}")
+        print(f"         elite_top{top}.txt:   {len(top_links)}")
+        print(f"         elite_reality.txt:      {len(reality)}")
+        print(f"         elite_grpc.txt:         {len(grpc)}")
+        print(f"         elite_low_latency.txt:  {len(low_lat)}")
+    except Exception as e:
+        print(f"  [4/4] Export: failed ({e})")
+
+    print(f"{'='*60}")
+    return sorted_links
 
 
 def cmd_update(args):
@@ -3796,10 +3900,14 @@ def cmd_update(args):
     print(f"  Work dir: {work_dir}")
     print(f"{'='*60}")
 
+    if getattr(args, "elite", False):
+        cli_banner()
+
     raw_links = fetch_all_sources(sources, work_dir=work_dir, fetch_mode=fetch_mode)
     before_dedup = len(raw_links)
     raw_links = list(dict.fromkeys(raw_links))
     print(f"\n  Collected: {before_dedup} configs  →  {len(raw_links)} after dedup\n")
+    all_working_elite: list[str] = []  # накапливаем для elite post-processing
 
     if not raw_links:
         print("❌  No configs to check.")
@@ -3847,6 +3955,7 @@ def cmd_update(args):
             continue
 
         total_working += len(working)
+        all_working_elite.extend(working)
         print(f"\n  ✅  Batch {batch_num}: {len(working)} working  |  "
               f"Total so far: {total_working}", flush=True)
 
@@ -3865,6 +3974,15 @@ def cmd_update(args):
         print("  ❌  No working configs found across all batches.")
         sys.exit(1)
     print(f"{'='*60}")
+
+    # ── Elite post-processing ─────────────────────────────────────────────────
+    if getattr(args, "elite", False) and all_working_elite:
+        _run_elite_postprocess(
+            all_working_elite,
+            outdir=getattr(args, "elite_output", "elite_output"),
+            top=getattr(args, "elite_top", 300),
+            verified_file=getattr(args, "elite_output", "elite_output") + "/verified_configs.txt",
+        )
 
 
 def cmd_fetch(args):
@@ -3906,6 +4024,11 @@ def cmd_check(args):
         stage4_threshold_ms=int(getattr(args, "stage4_threshold_ms", CHECK4_MAX_STACK_PING_MS)),
     )
 
+    if getattr(args, "elite", False) and working:
+        cli_banner()
+        working = elite_sort_configs(working)
+        print(f"  🏆  Elite sort applied: REALITY/tuic/hy2 configs prioritized")
+
     out = getattr(args, "output", None)
     if out:
         Path(out).write_text("\n".join(working), encoding="utf-8")
@@ -3914,6 +4037,14 @@ def cmd_check(args):
         print("\n  Working configs:")
         for l in working:
             print(l)
+
+    if getattr(args, "elite", False) and working:
+        _run_elite_postprocess(
+            working,
+            outdir=getattr(args, "elite_output", "elite_output"),
+            top=getattr(args, "elite_top", 300),
+            verified_file=getattr(args, "elite_output", "elite_output") + "/verified_configs.txt",
+        )
 
 
 def cmd_upload(args):
@@ -4450,6 +4581,12 @@ def main():
     p_update.add_argument("--port-base", dest="port_base", type=int, default=21000)
     p_update.add_argument("--mode", type=int, default=4, choices=[1, 2, 3, 4])
     p_update.add_argument("--batch-size", dest="batch_size", type=int, default=PING_BATCH_SIZE)
+    p_update.add_argument("--elite", action="store_true", default=False,
+                          help="Elite mode: score configs, prioritize REALITY/anti-DPI, save verified pool, export")
+    p_update.add_argument("--elite-output", dest="elite_output", default="elite_output",
+                          help="Directory for elite export (default: elite_output)")
+    p_update.add_argument("--elite-top", dest="elite_top", type=int, default=300,
+                          help="Max configs to export in elite_top.txt (default: 300)")
 
     # fetch
     p_fetch = sub.add_parser("fetch", help="Collect configs only (no upload)")
@@ -4465,6 +4602,12 @@ def main():
     p_check.add_argument("--output", "-o", help="Save working configs to file")
     p_check.add_argument("--workers", type=int, default=CHECK_WORKERS)
     p_check.add_argument("--port-base", dest="port_base", type=int, default=21000)
+    p_check.add_argument("--elite", action="store_true", default=False,
+                          help="Elite mode: sort by score, save verified pool, export elite configs")
+    p_check.add_argument("--elite-output", dest="elite_output", default="elite_output",
+                          help="Directory for elite export (default: elite_output)")
+    p_check.add_argument("--elite-top", dest="elite_top", type=int, default=300,
+                          help="Max configs to export in elite_top.txt (default: 300)")
 
     # upload
     p_upload = sub.add_parser("upload", help="Upload configs from a file to GitHub")
@@ -6425,7 +6568,7 @@ def cli_banner():
     print("=" * 70)
 
 
-cli_banner()
+# cli_banner() вызывается только при --elite (см. cmd_update/cmd_check)
 
 # =============================================================================
 # END ADVANCED MODE
