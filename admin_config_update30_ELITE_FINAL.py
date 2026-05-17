@@ -3783,90 +3783,204 @@ def cmd_setup(args):
 
 
 
+def _elite_score_sync(url: str, latency_ms: int = 0) -> float:
+    """Синхронный полный скор одного конфига через функции из блока 5901+.
+
+    Использует: reality_score(), anti_dpi_score(), geo_score(),
+    detect_protocol_priority(), calculate_transport_score(), calculate_final_score().
+    TLS-проверка выполняется если передан latency > 0 (по результатам tcp_ping);
+    иначе tls_ok=False (не штрафует, просто не добавляет бонус).
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        q = urllib.parse.parse_qs(parsed.query)
+
+        # Вычисляем компоненты через функции из блока 5901+
+        r_score   = reality_score(url)           # 0–115 (SNI, fp, pbk, security=reality)
+        a_score   = anti_dpi_score(url)          # 0–155 (splithttp/xhttp/grpc/fragment/reality)
+        priority  = detect_protocol_priority(url) # 10–100 по таблице PROTOCOL_PRIORITIES
+        transport = calculate_transport_score(url) # 0–40 (splithttp>xhttp>grpc>ws>tcp)
+
+        # Страна из SNI/хоста — используем geo_score()
+        sni = q.get("sni", [""])[0]
+        country = ""
+        if sni:
+            # Пробуем угадать страну по домену (простая эвристика)
+            for cc in ("nl", "de", "fi", "pl", "se"):
+                if f".{cc}" in sni.lower():
+                    country = cc.upper()
+                    break
+        g_score = geo_score(country)
+
+        # Нормализуем latency: 0 = неизвестно → нейтральный latency_score
+        lat = latency_ms if latency_ms > 0 else 300
+
+        score = calculate_final_score(
+            latency=lat,
+            tls_ok=bool(r_score > 0),  # REALITY конфиги считаем TLS-валидными
+            anti_dpi=a_score,
+            reality=r_score,
+            geo=g_score,
+            priority=priority + transport,  # транспортный бонус добавляем к priority
+        )
+        return score
+    except Exception:
+        return 0.0
+
+
 def _run_elite_postprocess(
     working: list[str],
     outdir: str = "elite_output",
     top: int = 300,
     verified_file: str = "elite_output/verified_configs.txt",
 ) -> list[str]:
-    """Elite post-processing pipeline:
-    1. elite_sort_configs()      — REALITY/tuic/hy2/grpc приоритизация
-    2. VerifiedPoolManager       — overwrite на первом запуске, append на последующих
-    3. ReputationDatabase        — обновляем score для каждого конфига
-    4. export_elite (sync-ver)   — пишем elite_all.json / elite_top.txt / elite_reality.txt
+    """Elite post-processing pipeline — полная версия:
+
+    [1] Smart dedup        — config_fingerprint() по host+port+pbk+sni+fp
+    [2] async validate_all — tcp_ping + tls_probe + EliteNode (если aiohttp доступен)
+        fallback           — _elite_score_sync() без сетевых проверок
+    [3] calculate_final_score() — взвешенный скор: latency/tls/anti_dpi/reality/geo/priority
+    [4] VerifiedPoolManager    — overwrite на первом запуске, append на последующих
+    [5] ReputationDatabase     — обновление score + latency для каждого хоста
+    [6] Export                 — elite_all.txt / elite_topN.txt / elite_reality.txt /
+                                 elite_grpc.txt / elite_low_latency.txt / elite_scored.json
 
     Возвращает отсортированный список (для дальнейшей загрузки на GitHub).
     """
     print(f"\n{'='*60}")
-    print(f"  🏆  ELITE POST-PROCESSING  ({len(working)} working configs)")
+    print(f"  🏆  ELITE POST-PROCESSING  ({len(working)} configs)")
     print(f"{'='*60}")
 
-    # Шаг 1 — elite sort (REALITY/tuic/hy2/grpc сначала)
-    sorted_links = elite_sort_configs(working)
-    print(f"  [1/4] Elite sort done — top protocol: {sorted_links[0].split('://')[0] if sorted_links else 'n/a'}")
+    # ── Шаг 1: Smart dedup по fingerprint ─────────────────────────────────────
+    before = len(working)
+    working = deduplicate_configs(working)
+    print(f"  [1/6] Smart dedup: {before} → {len(working)} (fingerprint: host+port+pbk+sni+fp)")
 
-    # Шаг 2 — VerifiedPoolManager (overwrite/append логика)
+    # ── Шаг 2: Scoring ────────────────────────────────────────────────────────
+    # Пробуем async validate_all (tcp_ping + tls_probe → реальный latency)
+    # Если aiohttp не установлен или async упал — fallback на sync scoring
+    elite_nodes: list[EliteNode] = []
+    used_async = False
+
+    try:
+        import aiohttp as _aiohttp_check  # noqa: проверка доступности
+        print(f"  [2/6] async validate_all: tcp_ping + tls_probe ({len(working)} configs, concurrency=200)...")
+        nodes = asyncio.run(validate_all(working, concurrency=200))
+        if nodes:
+            elite_nodes = nodes
+            used_async = True
+            print(f"  [2/6] async done: {len(elite_nodes)} EliteNodes built (real latency + TLS)")
+        else:
+            print(f"  [2/6] async returned 0 nodes — fallback to sync scoring")
+    except Exception as e:
+        print(f"  [2/6] async unavailable ({type(e).__name__}: {e}) — sync scoring")
+
+    if not used_async:
+        # Sync fallback: _elite_score_sync() без сетевых проверок
+        print(f"  [2/6] sync scoring via calculate_final_score() + reality/anti_dpi/geo/priority...")
+        for url in working:
+            try:
+                parsed = urllib.parse.urlparse(url)
+                host = parsed.hostname or ""
+                port = parsed.port or 443
+                score = _elite_score_sync(url, latency_ms=0)
+                elite_nodes.append(EliteNode(
+                    url=url,
+                    protocol=parsed.scheme,
+                    host=host,
+                    port=port,
+                    country="UNKNOWN",
+                    asn="UNKNOWN",
+                    latency=0,
+                    tls_ok=("reality" in url.lower()),
+                    anti_dpi=anti_dpi_score(url),
+                    score=score,
+                    first_seen=time.time(),
+                    last_seen=time.time(),
+                ))
+            except Exception:
+                pass
+        print(f"  [2/6] sync done: {len(elite_nodes)} nodes scored")
+
+    # Сортируем по score desc
+    elite_nodes.sort(key=lambda n: n.score, reverse=True)
+    sorted_links = [n.url for n in elite_nodes]
+
+    if sorted_links:
+        top_node = elite_nodes[0]
+        print(f"  [2/6] Top node: {top_node.protocol}://{top_node.host} "
+              f"score={top_node.score} latency={top_node.latency}ms anti_dpi={top_node.anti_dpi}")
+
+    # ── Шаг 3: VerifiedPoolManager ────────────────────────────────────────────
     try:
         vpm = VerifiedPoolManager(verified_file=verified_file)
         vpm.save_verified_configs(sorted_links)
-        print(f"  [2/4] VerifiedPoolManager: saved to {verified_file}")
+        print(f"  [3/6] VerifiedPoolManager → {verified_file}")
     except Exception as e:
-        print(f"  [2/4] VerifiedPoolManager: skipped ({e})")
+        print(f"  [3/6] VerifiedPoolManager: skipped ({e})")
 
-    # Шаг 3 — ReputationDatabase update для всех конфигов
+    # ── Шаг 4: ReputationDatabase (с реальным latency если был async) ─────────
     try:
-        for link in sorted_links:
-            try:
-                hp = _extract_host_port(link)
-                host = hp[0] if hp else ""
-            except Exception:
-                host = ""
-            REPUTATION_DB.update_node(host, success=True, latency=0)
-        print(f"  [3/4] ReputationDatabase: {len(sorted_links)} nodes updated")
+        for node in elite_nodes:
+            REPUTATION_DB.update_node(node.host, success=True, latency=node.latency or 0)
+        print(f"  [4/6] ReputationDatabase: {len(elite_nodes)} nodes updated")
     except Exception as e:
-        print(f"  [3/4] ReputationDatabase: skipped ({e})")
+        print(f"  [4/6] ReputationDatabase: skipped ({e})")
 
-    # Шаг 4 — Export elite (sync версия без async validate_node)
+    # ── Шаг 5: SQLite _update_score для всех рабочих конфигов ─────────────────
+    try:
+        for node in elite_nodes:
+            _update_score(node.url, success=True, latency=node.latency or 0, country=node.country)
+        print(f"  [5/6] SQLite scores: {len(elite_nodes)} records written")
+    except Exception as e:
+        print(f"  [5/6] SQLite: skipped ({e})")
+
+    # ── Шаг 6: Export ─────────────────────────────────────────────────────────
     try:
         out = Path(outdir)
         out.mkdir(parents=True, exist_ok=True)
 
-        # Сортируем по elite_sort score для экспорта
-        scored = []
-        for link in sorted_links:
-            low = link.lower()
-            s = 0
-            if "reality" in low: s += 100
-            if "tuic://" in low: s += 95
-            if "hy2://" in low or "hysteria2://" in low: s += 90
-            if "grpc" in low: s += 40
-            if "cloudflare" in low: s += 30
-            scored.append((s, link))
-        scored.sort(reverse=True)
+        all_links   = sorted_links
+        top_links   = all_links[:top]
+        reality     = [n.url for n in elite_nodes if "reality" in n.url.lower()]
+        grpc        = [n.url for n in elite_nodes if "grpc"    in n.url.lower()]
+        low_lat     = [n.url for n in elite_nodes if n.latency > 0 and n.latency < 150]
+        if not low_lat:
+            # fallback: топ-150 по score если latency неизвестен
+            low_lat = all_links[:min(len(all_links), 150)]
 
-        all_links = [l for _, l in scored]
-        top_links  = all_links[:top]
-        reality    = [l for l in all_links if "reality" in l.lower()]
-        grpc       = [l for l in all_links if "grpc" in l.lower()]
-        low_lat    = all_links[:min(len(all_links), 150)]  # топ-150 как прокси low-latency
+        # JSON с полными данными EliteNode (для дальнейшего анализа)
+        nodes_json = [
+            {
+                "url": n.url, "protocol": n.protocol, "host": n.host,
+                "port": n.port, "country": n.country, "asn": n.asn,
+                "latency_ms": n.latency, "tls_ok": n.tls_ok,
+                "anti_dpi": n.anti_dpi, "score": n.score,
+            }
+            for n in elite_nodes
+        ]
 
         (out / "elite_all.txt").write_text("\n".join(all_links), encoding="utf-8")
         (out / f"elite_top{top}.txt").write_text("\n".join(top_links), encoding="utf-8")
         (out / "elite_reality.txt").write_text("\n".join(reality), encoding="utf-8")
         (out / "elite_grpc.txt").write_text("\n".join(grpc), encoding="utf-8")
         (out / "elite_low_latency.txt").write_text("\n".join(low_lat), encoding="utf-8")
+        (out / "elite_scored.json").write_text(json.dumps(nodes_json, indent=2), encoding="utf-8")
 
-        print(f"  [4/4] Export → {outdir}/")
+        mode = "async+TLS" if used_async else "sync"
+        print(f"  [6/6] Export [{mode}] → {outdir}/")
         print(f"         elite_all.txt:          {len(all_links)}")
         print(f"         elite_top{top}.txt:   {len(top_links)}")
         print(f"         elite_reality.txt:      {len(reality)}")
         print(f"         elite_grpc.txt:         {len(grpc)}")
         print(f"         elite_low_latency.txt:  {len(low_lat)}")
+        print(f"         elite_scored.json:      {len(nodes_json)} nodes")
     except Exception as e:
-        print(f"  [4/4] Export: failed ({e})")
+        print(f"  [6/6] Export: failed ({e})")
 
     print(f"{'='*60}")
     return sorted_links
+
 
 
 def cmd_update(args):
@@ -3905,8 +4019,9 @@ def cmd_update(args):
 
     raw_links = fetch_all_sources(sources, work_dir=work_dir, fetch_mode=fetch_mode)
     before_dedup = len(raw_links)
-    raw_links = list(dict.fromkeys(raw_links))
-    print(f"\n  Collected: {before_dedup} configs  →  {len(raw_links)} after dedup\n")
+    # Smart dedup: по fingerprint (host+port+pbk+sni+fp) — ловит дубли с разным UUID
+    raw_links = deduplicate_configs(raw_links)
+    print(f"\n  Collected: {before_dedup} configs  →  {len(raw_links)} after smart dedup\n")
     all_working_elite: list[str] = []  # накапливаем для elite post-processing
 
     if not raw_links:
